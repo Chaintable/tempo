@@ -64,6 +64,12 @@ pub struct TempoGenesisInfo {
     /// Activation timestamp for T6 hardfork.
     #[serde(skip_serializing_if = "Option::is_none")]
     t6_time: Option<u64>,
+    /// Activation timestamp for T7 hardfork.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    t7_time: Option<u64>,
+    /// Activation timestamp for T8 hardfork.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    t8_time: Option<u64>,
 }
 
 impl TempoGenesisInfo {
@@ -94,6 +100,8 @@ impl TempoGenesisInfo {
             TempoHardfork::T4 => self.t4_time,
             TempoHardfork::T5 => self.t5_time,
             TempoHardfork::T6 => self.t6_time,
+            TempoHardfork::T7 => self.t7_time,
+            TempoHardfork::T8 => self.t8_time,
         }
     }
 }
@@ -380,22 +388,27 @@ mod tests {
     use crate::hardfork::{TempoHardfork, TempoHardforks};
     use alloy_primitives::hex;
     use commonware_codec::Encode as _;
+    #[cfg(feature = "cli")]
     use reth_chainspec::{ForkCondition, Hardforks};
+    #[cfg(feature = "cli")]
     use reth_cli::chainspec::ChainSpecParser as _;
 
     #[test]
+    #[cfg(feature = "cli")]
     fn can_load_testnet() {
         let _ = super::TempoChainSpecParser::parse("testnet")
             .expect("the testnet chainspec must always be well formed");
     }
 
     #[test]
+    #[cfg(feature = "cli")]
     fn can_load_dev() {
         let _ = super::TempoChainSpecParser::parse("dev")
             .expect("the dev chainspec must always be well formed");
     }
 
     #[test]
+    #[cfg(feature = "cli")]
     fn test_tempo_chainspec_has_tempo_hardforks() {
         let chainspec = super::TempoChainSpecParser::parse("mainnet")
             .expect("the mainnet chainspec must always be well formed");
@@ -410,6 +423,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "cli")]
     fn test_tempo_chainspec_implements_tempo_hardforks_trait() {
         let chainspec = super::TempoChainSpecParser::parse("mainnet")
             .expect("the mainnet chainspec must always be well formed");
@@ -442,6 +456,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "cli")]
     fn named_network_identities_use_compiled_identities() {
         let moderato = super::TempoChainSpecParser::parse("testnet")
             .expect("the moderato chainspec must always be well formed");
@@ -476,6 +491,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "cli")]
     fn test_tempo_hardforks_in_inner_hardforks() {
         let chainspec = super::TempoChainSpecParser::parse("mainnet")
             .expect("the mainnet chainspec must always be well formed");
@@ -529,6 +545,7 @@ mod tests {
         assert_eq!(chainspec.tempo_hardfork_at(u64::MAX), latest);
     }
 
+    #[cfg(feature = "cli")]
     mod tempo_hardfork_at {
         use super::*;
 
@@ -595,8 +612,16 @@ mod tests {
             // At and after T5 activation
             assert!(cs.is_t5_active_at_timestamp(1781013600));
             assert_eq!(cs.tempo_hardfork_at(1781013600), TempoHardfork::T5);
-            assert!(!cs.is_t6_active_at_timestamp(u64::MAX));
-            assert_eq!(cs.tempo_hardfork_at(u64::MAX), TempoHardfork::T5);
+            assert!(!cs.is_t6_active_at_timestamp(1781013600));
+
+            // Before T6 activation (1782223200 = Jun 23rd 2026 16:00 CEST)
+            assert!(!cs.is_t6_active_at_timestamp(1782223199));
+            assert_eq!(cs.tempo_hardfork_at(1782223199), TempoHardfork::T5);
+
+            // At and after T6 activation
+            assert!(cs.is_t6_active_at_timestamp(1782223200));
+            assert_eq!(cs.tempo_hardfork_at(1782223200), TempoHardfork::T6);
+            assert_eq!(cs.tempo_hardfork_at(u64::MAX), TempoHardfork::T6);
         }
 
         #[test]
@@ -659,8 +684,16 @@ mod tests {
             // At and after T5 activation
             assert!(cs.is_t5_active_at_timestamp(1780495200));
             assert_eq!(cs.tempo_hardfork_at(1780495200), TempoHardfork::T5);
-            assert!(!cs.is_t6_active_at_timestamp(u64::MAX));
-            assert_eq!(cs.tempo_hardfork_at(u64::MAX), TempoHardfork::T5);
+            assert!(!cs.is_t6_active_at_timestamp(1780495200));
+
+            // Before T6 activation (1781791200 = Jun 18th 2026 16:00 CEST)
+            assert!(!cs.is_t6_active_at_timestamp(1781791199));
+            assert_eq!(cs.tempo_hardfork_at(1781791199), TempoHardfork::T5);
+
+            // At and after T6 activation
+            assert!(cs.is_t6_active_at_timestamp(1781791200));
+            assert_eq!(cs.tempo_hardfork_at(1781791200), TempoHardfork::T6);
+            assert_eq!(cs.tempo_hardfork_at(u64::MAX), TempoHardfork::T6);
         }
 
         #[test]
@@ -676,6 +709,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "cli")]
     #[allow(clippy::expect_fun_call)]
     fn chainspec_from_chain_id_roundtrips_supported_chains() {
         use reth_chainspec::EthChainSpec;
