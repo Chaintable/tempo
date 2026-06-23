@@ -29,15 +29,12 @@ use reth_transaction_pool::{
 };
 use revm::database::BundleAccount;
 use std::{sync::Arc, time::Instant};
-use tempo_chainspec::{
-    TempoChainSpec,
-    hardfork::{TempoHardfork, TempoHardforks},
-};
+use tempo_chainspec::{TempoChainSpec, hardfork::TempoHardfork};
 use tempo_precompiles::{
     TIP_FEE_MANAGER_ADDRESS,
     account_keychain::AccountKeychain,
     error::Result as TempoPrecompileResult,
-    storage::Handler,
+    storage::{Handler, StorageActions},
     tip20::TIP20Token,
     tip403_registry::{REJECT_ALL_POLICY_ID, TIP403Registry},
 };
@@ -171,7 +168,7 @@ where
             .inner
             .fork_tracker()
             .tip_timestamp();
-        let spec = self.client().chain_spec().tempo_hardfork_at(tip_timestamp);
+        let spec = self.protocol_pool.validator().validator().active_hardfork();
 
         // Cache policy lookups per fee token to avoid redundant storage reads.
         // For compound policies (TIP-1015), the cache stores all sub-policy IDs
@@ -338,31 +335,33 @@ where
                 && let Some(ref mut provider) = state_provider
             {
                 let fee_token = tx.transaction.effective_fee_token();
-                let Ok(fee_payer) = tx.transaction.fee_payer() else {
-                    continue;
-                };
-
-                if updates
-                    .fee_balance_changes
-                    .get(&fee_token)
-                    .is_some_and(|accounts| accounts.contains(&fee_payer))
-                {
-                    let balance = match fee_balance_cache.entry((fee_token, fee_payer)) {
-                        Entry::Occupied(entry) => *entry.get(),
-                        Entry::Vacant(entry) => {
-                            let Ok(balance) =
-                                provider.get_token_balance(fee_token, fee_payer, spec)
-                            else {
-                                continue;
-                            };
-                            *entry.insert(balance)
-                        }
+                // only resolve the fee payer if the fee token saw balance changes
+                if let Some(accounts) = updates.fee_balance_changes.get(&fee_token) {
+                    let Ok(fee_payer) = tx.transaction.fee_payer() else {
+                        continue;
                     };
 
-                    if balance < tx.transaction.fee_token_cost() {
-                        to_remove.push(*tx.hash());
-                        insolvent_fee_payer_count += 1;
-                        continue;
+                    if accounts.contains(&fee_payer) {
+                        let balance = match fee_balance_cache.entry((fee_token, fee_payer)) {
+                            Entry::Occupied(entry) => *entry.get(),
+                            Entry::Vacant(entry) => {
+                                let Ok(balance) = provider.get_token_balance(
+                                    fee_token,
+                                    fee_payer,
+                                    spec,
+                                    StorageActions::disabled(),
+                                ) else {
+                                    continue;
+                                };
+                                *entry.insert(balance)
+                            }
+                        };
+
+                        if balance < tx.transaction.fee_token_cost() {
+                            to_remove.push(*tx.hash());
+                            insolvent_fee_payer_count += 1;
+                            continue;
+                        }
                     }
                 }
             }
@@ -531,14 +530,7 @@ where
                     };
 
                     // Get the active Tempo hardfork for expiring nonce handling
-                    let tip_timestamp = self
-                        .protocol_pool
-                        .validator()
-                        .validator()
-                        .inner
-                        .fork_tracker()
-                        .tip_timestamp();
-                    let hardfork = self.client().chain_spec().tempo_hardfork_at(tip_timestamp);
+                    let hardfork = self.protocol_pool.validator().validator().active_hardfork();
 
                     let tx = Arc::new(tx);
                     let added =
@@ -1260,23 +1252,27 @@ pub(crate) fn exceeds_spending_limit(
     spec: TempoHardfork,
 ) -> bool {
     provider
-        .with_read_only_storage_ctx(spec, || -> TempoPrecompileResult<bool> {
-            let keychain = AccountKeychain::new();
-            if !keychain.keys[subject.account][subject.key_id]
-                .read()?
-                .enforce_limits
-            {
-                return Ok(false);
-            }
+        .with_read_only_storage_ctx(
+            spec,
+            StorageActions::disabled(),
+            || -> TempoPrecompileResult<bool> {
+                let keychain = AccountKeychain::new();
+                if !keychain.keys[subject.account][subject.key_id]
+                    .read()?
+                    .enforce_limits
+                {
+                    return Ok(false);
+                }
 
-            let remaining = keychain.effective_remaining_limit(
-                subject.account,
-                subject.key_id,
-                subject.fee_token,
-                current_timestamp,
-            )?;
-            Ok(fee_token_cost > remaining)
-        })
+                let remaining = keychain.effective_remaining_limit(
+                    subject.account,
+                    subject.key_id,
+                    subject.fee_token,
+                    current_timestamp,
+                )?;
+                Ok(fee_token_cost > remaining)
+            },
+        )
         .unwrap_or_default()
 }
 
@@ -1297,7 +1293,7 @@ fn get_sender_policy_ids(
         return Some(cached.clone());
     }
 
-    provider.with_read_only_storage_ctx(spec, || {
+    provider.with_read_only_storage_ctx(spec, StorageActions::disabled(), || {
         let policy_id = TIP20Token::from_address(fee_token)
             .and_then(|t| t.transfer_policy_id())
             .ok()
@@ -1336,7 +1332,7 @@ fn get_recipient_policy_ids(
     fee_token: Address,
     spec: TempoHardfork,
 ) -> Option<Vec<u64>> {
-    provider.with_read_only_storage_ctx(spec, || {
+    provider.with_read_only_storage_ctx(spec, StorageActions::disabled(), || {
         let policy_id = TIP20Token::from_address(fee_token)
             .and_then(|t| t.transfer_policy_id())
             .ok()
