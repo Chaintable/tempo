@@ -243,7 +243,7 @@ mod tests {
         test_utils::OkValidator,
     };
     use std::sync::Arc;
-    use tempo_chainspec::hardfork::TempoHardfork;
+    use tempo_chainspec::{hardfork::TempoHardfork, spec::TEMPO_T1_BASE_FEE};
 
     type TestTx = Arc<ValidPoolTransaction<TempoPooledTransaction>>;
 
@@ -253,7 +253,7 @@ mod tests {
                 .nonce_key(nonce_key)
                 .nonce(nonce)
                 .max_priority_fee(priority)
-                .max_fee(u128::from(TempoHardfork::T1.base_fee()) + priority)
+                .max_fee(u128::from(TEMPO_T1_BASE_FEE) + priority)
                 .build(),
             TransactionOrigin::External,
         ))
@@ -310,7 +310,7 @@ mod tests {
                 .or_insert(id.nonce);
         }
 
-        pool.set_base_fee(TempoHardfork::T1.base_fee());
+        pool.set_base_fee(TEMPO_T1_BASE_FEE);
         for tx in txs {
             let id = tx
                 .transaction
@@ -330,7 +330,7 @@ mod tests {
         MergeBestTransactions::new(
             protocol_best_transactions(protocol_txs),
             aa_2d_best_transactions(aa_2d_txs),
-            TempoHardfork::T1.base_fee(),
+            TEMPO_T1_BASE_FEE,
         )
     }
 

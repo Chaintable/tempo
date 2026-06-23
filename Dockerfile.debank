@@ -1,7 +1,7 @@
 # Dockerfile.debank - DeBank fork of Tempo, builds only the `tempo` binary.
 # Based on upstream Dockerfile.chef + Dockerfile pattern, simplified for DeBank CI.
 
-FROM rust:1.93-bookworm AS chef
+FROM rust:1.96-bookworm AS chef
 
 RUN cargo install --locked cargo-chef sccache
 
