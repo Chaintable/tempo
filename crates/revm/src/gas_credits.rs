@@ -5,7 +5,7 @@ use crate::{
     evm::{TempoContext, TempoEvm},
 };
 use alloy_evm::Database;
-use alloy_primitives::{Address, Log, LogData, U256};
+use alloy_primitives::{Address, U256};
 use revm::{
     context::{Host as _, JournalTr, result::EVMError},
     context_interface::cfg::GasParams,
@@ -20,7 +20,7 @@ use tempo_chainspec::constants::gas::STORAGE_CREDIT_VALUE;
 use tempo_precompiles::{
     STORAGE_CREDITS_ADDRESS,
     storage::FromWord,
-    tip1060_storage_credits::{StorageCreditsBackend, TransientState, sstore_storage_credits},
+    storage_credits::{StorageCreditsBackend, TransientState, sstore_storage_credits},
 };
 
 /// Applies storage-credit settlement at the end of a transaction.
@@ -41,7 +41,6 @@ pub fn apply_refund<DB: Database, I>(
     let journal = &mut evm.inner.ctx.journaled_state;
 
     // Take the tx-local storage-credit slots so we can settle them while mutating the journal.
-    // This is safe cause refunds are applied in post-execution.
     let Some(slots) = journal.transient_storage.remove(&STORAGE_CREDITS_ADDRESS) else {
         return Ok(());
     };
@@ -139,22 +138,13 @@ impl<DB: Database> StorageCreditsBackend for StorageCreditsContext<'_, DB> {
     fn tstore(&mut self, address: Address, key: U256, value: U256) {
         self.context.tstore(address, key, value);
     }
-
-    #[inline]
-    fn emit_event(&mut self, address: Address, event: LogData) -> Result<(), Self::Error> {
-        self.context.log(Log {
-            address,
-            data: event,
-        });
-        Ok(())
-    }
 }
 
 /// Tempo SSTORE instruction with TIP-1060 storage-credit accounting.
 pub(crate) fn sstore<DB: Database>(
     context: InstructionContext<'_, TempoContext<DB>, EthInterpreter>,
 ) -> Result<(), InstructionResult> {
-    sstore_with_gas_accounting(context, |context, owner, values| {
+    sstore_with_gas_accounting(context, |context, owner, state_load| {
         {
             let InstructionContext { interpreter, host } = context;
             sstore_storage_credits(
@@ -163,12 +153,13 @@ pub(crate) fn sstore<DB: Database>(
                     gas_tracker: interpreter.gas.tracker_mut(),
                 },
                 owner,
-                values,
+                None,
+                state_load,
             )?;
         }
 
         // Storage-credit hook only handles TIP-1060 bookkeeping + state gas. Keep default
         // gas/refunds for cold, update, and residual costs. T7 gas table ensures no double-charge.
-        sstore_default_gas_accounting(context, owner, values)
+        sstore_default_gas_accounting(context, owner, state_load)
     })
 }
