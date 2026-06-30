@@ -17,9 +17,6 @@ const AXES = {
   block_time_p50: { floor: 0.70, lower: true },
   block_time_p90: { floor: 0.70, lower: true },
   block_time_p99: { floor: 1.60, lower: true },
-  serialized_block_size_per_tx_p50: { floor: 0.70, lower: true },
-  serialized_block_size_per_tx_p90: { floor: 0.70, lower: true },
-  serialized_block_size_per_tx_p99: { floor: 0.70, lower: true },
   validation_latency_p50: { floor: 1.55, lower: true },
   validation_latency_p90: { floor: 1.55, lower: true },
   validation_latency_p99: { floor: 2.05, lower: true },
@@ -36,9 +33,6 @@ const SECTIONS = [
       ['Block Time P50 [ms]', 'block_time_p50', v => fmtVal(v, 1)],
       ['Block Time P90 [ms]', 'block_time_p90', v => fmtVal(v, 1)],
       ['Block Time P99 [ms]', 'block_time_p99', v => fmtVal(v, 1)],
-      ['Serialized Block Size / Tx P50 [B/tx]', 'serialized_block_size_per_tx_p50', v => fmtVal(v, 1)],
-      ['Serialized Block Size / Tx P90 [B/tx]', 'serialized_block_size_per_tx_p90', v => fmtVal(v, 1)],
-      ['Serialized Block Size / Tx P99 [B/tx]', 'serialized_block_size_per_tx_p99', v => fmtVal(v, 1)],
     ],
   },
   {
@@ -82,6 +76,9 @@ const BUILDER_DETAIL_ROWS = [
   ['Serialized Block Size P50 [KiB]', 'serialized_block_size_p50', fmtKiB],
   ['Serialized Block Size P90 [KiB]', 'serialized_block_size_p90', fmtKiB],
   ['Serialized Block Size P99 [KiB]', 'serialized_block_size_p99', fmtKiB],
+  ['Serialized Block Size / Tx P50 [B/tx]', 'serialized_block_size_per_tx_p50', v => fmtVal(v, 1)],
+  ['Serialized Block Size / Tx P90 [B/tx]', 'serialized_block_size_per_tx_p90', v => fmtVal(v, 1)],
+  ['Serialized Block Size / Tx P99 [B/tx]', 'serialized_block_size_per_tx_p99', v => fmtVal(v, 1)],
   ['Fill Overhead P50 [ms]', 'builder_fill_overhead_p50', v => fmtVal(v, 1)],
   ['Fill Overhead P90 [ms]', 'builder_fill_overhead_p90', v => fmtVal(v, 1)],
   ['Fill Overhead P99 [ms]', 'builder_fill_overhead_p99', v => fmtVal(v, 1)],
@@ -217,11 +214,12 @@ function buildMarkdown(summary) {
   const derekCommand = summary.config?.derek_command || '';
   const baselineRemovedArgs = summary.config?.baseline_removed_args || '';
   const featureRemovedArgs = summary.config?.feature_removed_args || '';
+  const featureOnly = summary.config?.run_side === 'feature';
   const lines = [
-    `# ${c.emoji} Bench Comparison: ${c.label}`,
+    featureOnly ? `# ${c.emoji} Feature Bench: ${c.label}` : `# ${c.emoji} Bench Comparison: ${c.label}`,
     '',
     `**Refs:** ${summary.baseline_ref} vs ${summary.feature_ref}`,
-    `**Criteria:** 95% run-bootstrap CI must clear floor; cells show delta (+/-CI/floor).`,
+    featureOnly ? `**Criteria:** Feature-only run; baseline columns are intentionally empty.` : `**Criteria:** 95% run-bootstrap CI must clear floor; cells show delta (+/-CI/floor).`,
     '',
     '## Configuration',
     ...(derekCommand ? [`- Derek command: \`${derekCommand}\``] : []),
@@ -231,6 +229,7 @@ function buildMarkdown(summary) {
     `- Target TPS: ${summary.config.tps}`,
     `- Duration: ${summary.config.duration}s`,
     `- Run pairs: ${summary.config.run_pairs}`,
+    ...(featureOnly ? [`- Run side: feature`] : []),
     ...(baselineRemovedArgs ? [`- Baseline removed args: \`${baselineRemovedArgs}\``] : []),
     ...(featureRemovedArgs ? [`- Feature removed args: \`${featureRemovedArgs}\``] : []),
     `- Baseline blocks: ${summary.results.baseline.blocks}`,

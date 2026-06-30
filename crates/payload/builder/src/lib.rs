@@ -4,6 +4,7 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 mod budget;
+mod encode;
 mod metrics;
 mod prewarming;
 
@@ -16,12 +17,13 @@ use crate::{
         BUILD_TIME_MULTIPLIER_SCALE, decay_build_time_multiplier, observed_build_time_multiplier,
         payload_budget_decision, scaled_build_time_multiplier,
     },
+    encode::{EncodedBlockTransactionList, EncodedBlockTransactionsBuilder, ExecutionBlockEncoder},
     metrics::{BlockBuildStopReason, InstrumentedFinishProvider, TempoPayloadBuilderMetrics},
     prewarming::BestTransactionsPrewarming,
 };
-use alloy_consensus::{BlockHeader as _, Signed, Transaction, TxLegacy, TxReceipt};
+use alloy_consensus::{BlockHeader as _, Signed, Transaction as _, TxLegacy, TxReceipt};
 use alloy_eip7928::bal::Bal;
-use alloy_eips::eip2718::Encodable2718;
+use alloy_eips::{eip1559::calculate_block_gas_limit, eip2718::Encodable2718};
 use alloy_primitives::{Address, B256, Bloom, Bytes, U256, keccak256};
 use alloy_rlp::{Decodable, Encodable};
 use reth_basic_payload_builder::{
@@ -82,11 +84,19 @@ use tempo_transaction_pool::{
 use tokio::sync::oneshot;
 use tracing::{Level, debug, debug_span, error, info, instrument, trace, warn};
 
+/// Conservative estimate for non-transaction execution block RLP bytes.
+///
+/// Exact block RLP length is computed asynchronously after payload construction, so the builder uses
+/// this margin together with known transaction, withdrawal, and extra-data lengths for Osaka size
+/// checks and pacing estimates.
+const NON_TRANSACTION_SIZE_ESTIMATE: usize = 2048;
+
 #[derive(Debug, Clone)]
 pub struct TempoPayloadBuilder<Provider> {
     pool: TempoTransactionPool<Provider>,
     provider: Provider,
     executor: TaskExecutor,
+    config: TempoPayloadBuilderConfig,
     evm_config: TempoEvmConfig,
     metrics: TempoPayloadBuilderMetrics,
     cache_metrics: CachedStateMetrics,
@@ -100,12 +110,6 @@ pub struct TempoPayloadBuilder<Provider> {
     /// last height at which we've seen an invalid subblock, and not including any subblocks
     /// at this height for any payloads.
     highest_invalid_subblock: Arc<AtomicU64>,
-    /// Whether the node is configured in `--dev` miner mode.
-    is_dev: bool,
-    /// Whether to enable state provider metrics.
-    state_provider_metrics: bool,
-    /// Whether to enable prewarming of best transactions.
-    enable_prewarming: bool,
     /// Whether to include block access lists in built execution payloads.
     enable_bal: bool,
     /// Learned estimate of total replayable build work divided by work at tx cutoff.
@@ -118,12 +122,18 @@ pub struct TempoPayloadBuilder<Provider> {
 /// Runtime settings for the Tempo payload builder.
 #[derive(Debug, Clone, Copy)]
 pub struct TempoPayloadBuilderConfig {
+    /// Desired gas limit.
+    ///
+    /// If not set, the parent gas limit is used.
+    pub desired_gas_limit: Option<u64>,
     /// Whether the node is configured in `--dev` miner mode.
     pub is_dev: bool,
     /// Whether to enable state provider metrics.
     pub state_provider_metrics: bool,
     /// Whether to enable prewarming of best transactions.
     pub enable_prewarming: bool,
+    /// Whether payload builds should skip state-root computation.
+    pub skip_state_root: bool,
     /// Initial estimate of total replayable build work divided by work at tx cutoff.
     ///
     /// `1.0` means no finish-work headroom beyond observed work so far. Values
@@ -132,14 +142,22 @@ pub struct TempoPayloadBuilderConfig {
     pub build_time_multiplier: f64,
 }
 
-impl Default for TempoPayloadBuilderConfig {
-    fn default() -> Self {
-        Self {
-            is_dev: false,
-            state_provider_metrics: false,
-            enable_prewarming: true,
-            build_time_multiplier: DEFAULT_BUILD_TIME_MULTIPLIER,
-        }
+impl TempoPayloadBuilderConfig {
+    /// Returns the gas limit for the next block based on the parent gas limit and an optional
+    /// target from payload attributes.
+    ///
+    /// If [`TempoPayloadBuilderConfig::desired_gas_limit`] is [`None`], the parent gas limit is used.
+    pub fn gas_limit_with_target(
+        &self,
+        parent_gas_limit: u64,
+        target_gas_limit: Option<u64>,
+    ) -> u64 {
+        calculate_block_gas_limit(
+            parent_gas_limit,
+            target_gas_limit
+                .or(self.desired_gas_limit)
+                .unwrap_or(parent_gas_limit),
+        )
     }
 }
 
@@ -155,13 +173,11 @@ impl<Provider> TempoPayloadBuilder<Provider> {
             pool,
             provider,
             executor,
+            config,
             evm_config,
             metrics: TempoPayloadBuilderMetrics::default(),
             cache_metrics: CachedStateMetrics::zeroed(CachedStateMetricsSource::Builder),
             highest_invalid_subblock: Default::default(),
-            is_dev: config.is_dev,
-            state_provider_metrics: config.state_provider_metrics,
-            enable_prewarming: config.enable_prewarming,
             enable_bal: cfg!(feature = "bal"),
             build_time_multiplier: Arc::new(AtomicU64::new(scaled_build_time_multiplier(
                 config.build_time_multiplier,
@@ -324,7 +340,7 @@ where
             // When trie handle is provided, we build the payload once so the shared trie can be reused.
             trie_handle.is_some()
             // `--dev` mode does not use the shared-trie builder flow.
-            && !self.is_dev;
+            && !self.config.is_dev;
 
         macro_rules! check_cancel {
             () => {
@@ -353,7 +369,7 @@ where
                 Some(self.cache_metrics.clone()),
             ));
         }
-        if self.state_provider_metrics {
+        if self.config.state_provider_metrics {
             state_provider = Box::new(InstrumentedStateProvider::new(state_provider, "builder"));
         }
 
@@ -375,7 +391,9 @@ where
             .chain_spec()
             .is_osaka_active_at_timestamp(attributes.timestamp);
 
-        let block_gas_limit: u64 = parent_header.gas_limit();
+        let block_gas_limit = self
+            .config
+            .gas_limit_with_target(parent_header.gas_limit(), attributes.target_gas_limit);
         let shared_gas_limit =
             chain_spec.shared_gas_limit_at(attributes.timestamp, block_gas_limit);
         // Non-shared gas limit is the maximum gas available for proposer's pool transactions.
@@ -391,13 +409,12 @@ where
         let mut cumulative_gas_used = 0;
         let mut cumulative_state_gas_used = 0u64;
         let mut non_payment_gas_used = 0;
-        // initial block size usage - size of withdrawals plus 1Kb of overhead for the block header
-        let mut block_size_used = attributes
+        let mut estimated_rlp_block_size = attributes
             .withdrawals
             .as_ref()
             .map(|w| w.length())
             .unwrap_or(0)
-            + 1024
+            + NON_TRANSACTION_SIZE_ESTIMATE
             + attributes.extra_data().length();
         let mut payment_transactions = 0u64;
         let mut pool_transactions_yielded = 0u64;
@@ -428,7 +445,7 @@ where
             }
 
             // Account for the subblock's size
-            block_size_used += subblock.total_tx_size();
+            estimated_rlp_block_size += subblock.total_tx_size();
 
             true
         });
@@ -514,12 +531,19 @@ where
         let prepare_system_txs_start = Instant::now();
         let system_txs = self.build_seal_block_txs(executor.evm(), &subblocks);
         for tx in &system_txs {
-            block_size_used += tx.inner().length();
+            estimated_rlp_block_size += tx.inner().length();
         }
         let prepare_system_txs_elapsed = prepare_system_txs_start.elapsed();
         self.metrics
             .prepare_system_transactions_duration_seconds
             .record(prepare_system_txs_elapsed);
+
+        if is_osaka && estimated_rlp_block_size > MAX_RLP_BLOCK_SIZE {
+            return Err(PayloadBuilderError::other(ConsensusError::BlockTooLarge {
+                rlp_length: estimated_rlp_block_size,
+                max_rlp_length: MAX_RLP_BLOCK_SIZE,
+            }));
+        }
 
         let base_fee = executor.evm().block().basefee;
         let pool_fetch_start = Instant::now();
@@ -533,7 +557,7 @@ where
         ));
         // Wrap best transactions into state-aware wrapper to skip transactions that
         // get invalidated by already-executed ones.
-        let mut best_txs = StateAwareBestTransactions::new(if self.enable_prewarming {
+        let mut best_txs = StateAwareBestTransactions::new(if self.config.enable_prewarming {
             Box::new(BestTransactionsPrewarming::new(
                 self.executor.clone(),
                 self.provider.clone(),
@@ -575,7 +599,7 @@ where
                     normal_transaction_fill_idle_elapsed,
                     build_time_multiplier,
                     marshal_persist,
-                    block_size_used,
+                    estimated_rlp_block_size,
                     validation_latency,
                     current_workload,
                 );
@@ -592,7 +616,7 @@ where
                         ?current_workload,
                         gas_used = cumulative_gas_used,
                         transactions = pool_transactions_included,
-                        block_size_used,
+                        estimated_rlp_block_size,
                         build_time_multiplier = build_time_multiplier as f64
                             / BUILD_TIME_MULTIPLIER_SCALE as f64,
                         "stopping pool transaction execution before payload build budget is exhausted"
@@ -670,7 +694,7 @@ where
             }
 
             let tx_rlp_length = pool_tx.transaction.encoded_length();
-            let estimated_block_size_with_tx = block_size_used + tx_rlp_length;
+            let estimated_block_size_with_tx = estimated_rlp_block_size + tx_rlp_length;
 
             if is_osaka && estimated_block_size_with_tx > MAX_RLP_BLOCK_SIZE {
                 best_txs.mark_invalid(
@@ -741,7 +765,7 @@ where
             }
 
             pool_transactions_included += 1;
-            block_size_used += tx_rlp_length;
+            estimated_rlp_block_size += tx_rlp_length;
             let _ = roots_tx.send((
                 BuilderTx::Pooled(pool_tx),
                 executor.receipts().last().unwrap().clone(),
@@ -915,7 +939,15 @@ where
         };
 
         let (state_root_outcome, sparse_trie_state_root_wait_elapsed) =
-            if let Some(mut handle) = trie_handle {
+            if self.config.skip_state_root {
+                debug!(
+                    target: "payload_builder",
+                    id = %payload_id,
+                    state_root = ?parent_header.state_root(),
+                    "skipping payload state-root computation"
+                );
+                None
+            } else if let Some(mut handle) = trie_handle {
                 let state_root_wait_start = Instant::now();
                 let _span = debug_span!(target: "payload_builder", "await_state_root").entered();
                 match handle.state_root() {
@@ -954,7 +986,9 @@ where
             (None, None)
         };
 
-        let (state_root, trie_updates) = if let Some(outcome) = state_root_outcome {
+        let (state_root, trie_updates) = if self.config.skip_state_root {
+            (parent_header.state_root(), Arc::new(Default::default()))
+        } else if let Some(outcome) = state_root_outcome {
             (outcome.state_root, outcome.trie_updates)
         } else {
             let (state_root, trie_updates) = finish_provider
@@ -964,7 +998,14 @@ where
             (state_root, Arc::new(trie_updates))
         };
 
-        let (transactions_root, receipts_root, receipts_bloom, transactions, senders) = roots_rx
+        let RootsTaskResult {
+            transactions_root,
+            receipts_root,
+            receipts_bloom,
+            transactions,
+            senders,
+            encoded_block_transactions,
+        } = roots_rx
             .blocking_recv()
             .map_err(PayloadBuilderError::other)?;
 
@@ -1034,15 +1075,6 @@ where
             .is_prague_active_at_timestamp(attributes.timestamp)
             .then(|| execution_result.requests.clone());
 
-        let rlp_length = block.rlp_length();
-
-        if is_osaka && rlp_length > MAX_RLP_BLOCK_SIZE {
-            return Err(PayloadBuilderError::other(ConsensusError::BlockTooLarge {
-                rlp_length,
-                max_rlp_length: MAX_RLP_BLOCK_SIZE,
-            }));
-        }
-
         let pool_transactions_inclusion_ratio = if pool_transactions_yielded == 0 {
             0.0
         } else {
@@ -1078,8 +1110,14 @@ where
                 validation_work_at_tx_cutoff,
             );
         }
+        if is_osaka && estimated_rlp_block_size > MAX_RLP_BLOCK_SIZE {
+            return Err(PayloadBuilderError::other(ConsensusError::BlockTooLarge {
+                rlp_length: estimated_rlp_block_size,
+                max_rlp_length: MAX_RLP_BLOCK_SIZE,
+            }));
+        }
         let recorded_block_size_bytes =
-            rlp_length + block_access_list.as_ref().map_or(0, Encodable::length);
+            estimated_rlp_block_size + block_access_list.as_ref().map_or(0, Encodable::length);
         let final_workload = ValidationLatencyWorkload::new(gas_used, total_transactions);
         let validation_latency_duration = validation_latency
             .and_then(|estimate| estimate.estimate(final_workload))
@@ -1127,6 +1165,15 @@ where
         );
 
         let block = Arc::new(block);
+        let execution_block_encoder = ExecutionBlockEncoder::new(
+            block.clone(),
+            estimated_rlp_block_size,
+            encoded_block_transactions,
+        );
+        // Clone the shared cache handle into the payload before the encoder is dropped.
+        let execution_block_encoded = execution_block_encoder.encoded_block();
+        // Drop the encoder off-thread so its `Drop` impl can populate the cache in the background.
+        self.executor.spawn_drop(execution_block_encoder);
         let eth_payload = EthBuiltPayload::new(block.clone(), total_fees, requests, None);
 
         let execution_output = BlockExecutionOutput {
@@ -1147,6 +1194,8 @@ where
             Some(executed_block),
             validation_work_duration,
             validation_latency_duration,
+            estimated_rlp_block_size,
+            execution_block_encoded,
         );
 
         drop(db);
@@ -1161,12 +1210,11 @@ where
         }
     }
 
-    #[expect(clippy::type_complexity)]
     fn spawn_roots_task(
         &self,
     ) -> (
         Sender<(BuilderTx, TempoReceipt)>,
-        oneshot::Receiver<(B256, B256, Bloom, Vec<TempoTxEnvelope>, Vec<Address>)>,
+        oneshot::Receiver<RootsTaskResult>,
     ) {
         let (transactions_tx, transactions_rx) =
             crossbeam_channel::unbounded::<(BuilderTx, TempoReceipt)>();
@@ -1180,6 +1228,7 @@ where
                 let mut transactions_root = OrderedTrieRootEncodedBuilder::new();
                 let mut receipts_root = OrderedTrieRootEncodedBuilder::new();
                 let mut receipts_bloom = Bloom::ZERO;
+                let mut encoded_block_transactions = EncodedBlockTransactionsBuilder::default();
 
                 let mut buf = Vec::new();
 
@@ -1188,6 +1237,7 @@ where
                     buf.clear();
                     tx.encode_2718(&mut buf);
                     transactions_root.push_next(&buf);
+                    encoded_block_transactions.push(&tx, &buf);
                     transactions.push(tx);
                     senders.push(sender);
 
@@ -1200,13 +1250,14 @@ where
                 }
                 let transactions_root = transactions_root.finalize();
                 let receipts_root = receipts_root.finalize();
-                let _ = result_tx.send((
+                let _ = result_tx.send(RootsTaskResult {
                     transactions_root,
                     receipts_root,
                     receipts_bloom,
                     transactions,
                     senders,
-                ));
+                    encoded_block_transactions: encoded_block_transactions.finish(),
+                });
             });
 
         (transactions_tx, result_rx)
@@ -1366,6 +1417,26 @@ impl BuilderTx {
     }
 }
 
+/// Result produced by the roots task while finalizing payload block data.
+#[derive(Debug)]
+pub(crate) struct RootsTaskResult {
+    /// The root hash of the transaction trie.
+    transactions_root: B256,
+    /// The root hash of the receipts trie.
+    receipts_root: B256,
+    /// The receipts bloom filter.
+    receipts_bloom: Bloom,
+    /// The transactions included in the block.
+    transactions: Vec<TempoTxEnvelope>,
+    /// The senders of the transactions.
+    senders: Vec<Address>,
+    /// The RLP encoded transaction list for the block body.
+    ///
+    /// Since roots task already encodes every transaction for the transaction trie,
+    /// we can reuse those bytes for the [`ExecutionBlockEncoder`].
+    encoded_block_transactions: EncodedBlockTransactionList,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1373,6 +1444,7 @@ mod tests {
     use alloy_primitives::{Address, B256, Bytes};
     use core::num::NonZeroU64;
     use reth_primitives_traits::Block as _;
+    use tempo_payload_types::EncodedBlock;
     use tempo_primitives::{
         AASigned, Block, SignedSubBlock, SubBlock, SubBlockVersion, TempoSignature,
         TempoTransaction,
@@ -1455,7 +1527,15 @@ mod tests {
         .try_into_recovered()
         .unwrap();
         let eth = EthBuiltPayload::new(Arc::new(block), U256::ZERO, None, None);
-        TempoBuiltPayload::new(eth, None, None, Duration::ZERO, Duration::ZERO)
+        TempoBuiltPayload::new(
+            eth,
+            None,
+            None,
+            Duration::ZERO,
+            Duration::ZERO,
+            NON_TRANSACTION_SIZE_ESTIMATE,
+            EncodedBlock::default(),
+        )
     }
 
     #[test]

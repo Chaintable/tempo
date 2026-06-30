@@ -16,8 +16,10 @@ const E2E_A_CPUS = "0-7,16-23"
 const E2E_B_CPUS = "8-15,24-31"
 const E2E_A_MEMORY = "60G"
 const E2E_B_MEMORY = "60G"
-const E2E_GAS_LIMIT = "1000000000"
+const E2E_GAS_LIMIT = "5000000000"
+const E2E_RUNNER_METRICS_URL = "http://127.0.0.1:9100/metrics"
 const E2E_BLOAT_TMP_DIR = "/reth-bench-a/.bench-tmp/e2e-local-init"
+const TRACY_SAMPLING_HZ = 18999
 const E2E_BLOAT_FREE_MARGIN_MIB = 51200
 const E2E_DEFAULT_BLOAT = 100
 const E2E_LOCAL_RETH_ARGS = [
@@ -192,6 +194,27 @@ def df-available-mib [path: string] {
     $row | get 3 | into int
 }
 
+def e2e-db-size-bytes [datadir: string] {
+    let paths = [
+        $"($datadir)/db"
+        $"($datadir)/static_files"
+    ] | where { |path| $path | path exists }
+    if ($paths | is-empty) {
+        return 0
+    }
+
+    let result = (^du -sb ...$paths | complete)
+    if $result.exit_code != 0 {
+        if $result.stderr != "" { print $result.stderr }
+        return 0
+    }
+
+    $result.stdout
+        | lines
+        | each { |line| $line | split row --regex '\s+' | first | into int }
+        | math sum
+}
+
 def ensure-bloat-space [bloat: int] {
     if $bloat <= 0 {
         return
@@ -353,10 +376,31 @@ def e2e-snapshot-state-gas-limit [datadir: string] {
     ""
 }
 
+def e2e-snapshot-state-general-gas-limit [datadir: string] {
+    let marker = (read-bench-marker $datadir)
+    if $marker != null {
+        let marker_general_gas_limit = ($marker | get -o general_gas_limit | default "")
+        if $marker_general_gas_limit != "" {
+            return (normalize-gas-limit $marker_general_gas_limit)
+        }
+    }
+
+    let genesis_path = $"($datadir)/($BENCH_META_SUBDIR)/genesis.json"
+    if ($genesis_path | path exists) {
+        let genesis_general_gas_limit = (open $genesis_path | get -o config.generalGasLimit | default "")
+        if $genesis_general_gas_limit != "" {
+            return (normalize-gas-limit $genesis_general_gas_limit)
+        }
+    }
+
+    ""
+}
+
 def e2e-update-snapshot-genesis-marker [
     datadir: string,
     hardfork: string,
     gas_limit: string,
+    general_gas_limit: string,
 ] {
     let marker_path = $"($datadir)/($BENCH_META_SUBDIR)/marker.json"
     mut marker = (open $marker_path)
@@ -367,6 +411,11 @@ def e2e-update-snapshot-genesis-marker [
     if $gas_limit != "" {
         $marker = ($marker | upsert gas_limit (normalize-gas-limit $gas_limit))
     }
+    if $general_gas_limit != "" {
+        $marker = ($marker | upsert general_gas_limit (normalize-gas-limit $general_gas_limit))
+    } else {
+        $marker = ($marker | reject -o general_gas_limit)
+    }
     $marker | to json | save -f $marker_path
 }
 
@@ -375,6 +424,7 @@ def e2e-synthesize-genesis [
     target_genesis: string,
     hardfork: string,
     gas_limit: string,
+    general_gas_limit: string,
 ] {
     let source = (open $source_genesis)
     mut config = ($source | get config)
@@ -385,6 +435,13 @@ def e2e-synthesize-genesis [
             $config = ($config | upsert $field.name $field.value)
         }
         $patch_labels = ($patch_labels | append $"hardfork=($fork)")
+    }
+    if $general_gas_limit != "" {
+        let normalized_general_gas_limit = (normalize-gas-limit $general_gas_limit)
+        $config = ($config | upsert generalGasLimit ($normalized_general_gas_limit | into int))
+        $patch_labels = ($patch_labels | append $"general_gas_limit=($normalized_general_gas_limit)")
+    } else {
+        $config = ($config | reject -o generalGasLimit)
     }
     mut genesis = ($source | upsert config $config)
     if $gas_limit != "" {
@@ -409,14 +466,18 @@ def e2e-regenesis [
     datadir: string,
     hardfork: string,
     gas_limit: string,
+    general_gas_limit: string,
 ] {
     let target_hardfork = if $hardfork != "" { normalize-hardfork $hardfork } else { latest-tempo-hardfork }
     let target_gas_limit = if $gas_limit != "" { normalize-gas-limit $gas_limit } else { "" }
+    let target_general_gas_limit = if $general_gas_limit != "" { normalize-gas-limit $general_gas_limit } else { "" }
     let current_hardfork = (e2e-snapshot-state-hardfork $datadir)
     let current_gas_limit = (e2e-snapshot-state-gas-limit $datadir)
+    let current_general_gas_limit = (e2e-snapshot-state-general-gas-limit $datadir)
     let hardfork_matches = $current_hardfork == $target_hardfork
     let gas_limit_matches = $target_gas_limit == "" or $current_gas_limit == $target_gas_limit
-    if $hardfork_matches and $gas_limit_matches {
+    let general_gas_limit_matches = $current_general_gas_limit == $target_general_gas_limit
+    if $hardfork_matches and $gas_limit_matches and $general_gas_limit_matches {
         mut matches = []
         if $target_hardfork != "" {
             $matches = ($matches | append $"state_hardfork=($target_hardfork)")
@@ -424,12 +485,15 @@ def e2e-regenesis [
         if $target_gas_limit != "" {
             $matches = ($matches | append $"gas_limit=($target_gas_limit)")
         }
+        if $target_general_gas_limit != "" {
+            $matches = ($matches | append $"general_gas_limit=($target_general_gas_limit)")
+        }
         print $"Skipping tempo regenesis for ($datadir); marker already matches (($matches | str join ', '))"
         return
     }
 
     let target_genesis = $"($datadir)/($BENCH_META_SUBDIR)/regenesis-target.json"
-    e2e-synthesize-genesis $genesis $target_genesis $target_hardfork $target_gas_limit
+    e2e-synthesize-genesis $genesis $target_genesis $target_hardfork $target_gas_limit $target_general_gas_limit
 
     mut changes = []
     if not $hardfork_matches {
@@ -437,6 +501,9 @@ def e2e-regenesis [
     }
     if not $gas_limit_matches {
         $changes = ($changes | append $"gas_limit=($current_gas_limit) -> ($target_gas_limit)")
+    }
+    if not $general_gas_limit_matches {
+        $changes = ($changes | append $"general_gas_limit=($current_general_gas_limit) -> ($target_general_gas_limit)")
     }
     print $"Running tempo regenesis for ($datadir): ($changes | str join ', ') with ($target_genesis)..."
     let result = (run-external $tempo_bin "regenesis" "--chain" $target_genesis "--datadir" $datadir | complete)
@@ -446,8 +513,8 @@ def e2e-regenesis [
         print $"Error: tempo regenesis failed for ($datadir) with exit code ($result.exit_code)"
         exit $result.exit_code
     }
-    e2e-synthesize-genesis $"($datadir)/($BENCH_META_SUBDIR)/genesis.json" $"($datadir)/($BENCH_META_SUBDIR)/genesis.json" $target_hardfork $target_gas_limit
-    e2e-update-snapshot-genesis-marker $datadir $target_hardfork $target_gas_limit
+    e2e-synthesize-genesis $"($datadir)/($BENCH_META_SUBDIR)/genesis.json" $"($datadir)/($BENCH_META_SUBDIR)/genesis.json" $target_hardfork $target_gas_limit $target_general_gas_limit
+    e2e-update-snapshot-genesis-marker $datadir $target_hardfork $target_gas_limit $target_general_gas_limit
     rm $target_genesis
 }
 
@@ -481,8 +548,6 @@ def systemd-scope-command [unit: string, cpus: string, memory: string, script: s
         [$"--preserve-env=($telemetry_env_names | str join ',')"]
     } else { [] }
     let telemetry_env = ($telemetry_env_names | each { |name| $"--setenv=($name)" })
-    let uid = (id -u | str trim)
-    let gid = (id -g | str trim)
     [
         "sudo"
         ...$preserve_env_args
@@ -492,8 +557,6 @@ def systemd-scope-command [unit: string, cpus: string, memory: string, script: s
         "--collect"
         "--same-dir"
         "--unit" $unit
-        "--uid" $uid
-        "--gid" $gid
         ...$telemetry_env
         ...$memory_args
         "bash"
@@ -589,7 +652,7 @@ def stop-e2e-processes-gracefully [] {
         print $"Stopping tempo processes: ($pids | str join ', ')"
     }
     for pid in $pids {
-        kill -s 2 $pid
+        sudo kill -s 2 $pid
     }
     for pid in $pids {
         mut wait = 0
@@ -600,7 +663,7 @@ def stop-e2e-processes-gracefully [] {
         }
         if $wait >= 30 {
             print $"  Warning: PID ($pid) did not exit, sending SIGKILL"
-            kill -s 9 $pid
+            sudo kill -s 9 $pid
             sleep 1sec
         }
     }
@@ -613,7 +676,7 @@ def stop-tracy-capture [] {
     print "  Stopping tracy-capture..."
     let capture_pids = (ps | where name =~ "tracy-capture" | get pid)
     for pid in $capture_pids {
-        kill -s 2 $pid
+        sudo kill -s 2 $pid
     }
     mut wait_tracy = 0
     while $wait_tracy < 30 {
@@ -624,8 +687,26 @@ def stop-tracy-capture [] {
     if $wait_tracy >= 30 {
         print "  Warning: tracy-capture did not exit, sending SIGKILL"
         for pid in (ps | where name =~ "tracy-capture" | get pid) {
-            kill -s 9 $pid
+            sudo kill -s 9 $pid
         }
+    }
+}
+
+def wait-for-tracy-capture-exit [job_id: int, phase: string] {
+    print "  Waiting for tracy-capture to exit and close trace..."
+    let result = (try {
+        job recv --tag 18999 --timeout 45sec
+    } catch {
+        null
+    })
+    if $result == null {
+        print $"  Warning: tracy-capture job did not report completion for ($phase); killing job ($job_id)"
+        try { job kill $job_id } catch {}
+        return
+    }
+    let exit_code = ($result | get --optional exit_code | default 0)
+    if $exit_code != 0 {
+        print $"  Warning: tracy-capture exited with code ($exit_code) for ($phase)"
     }
 }
 
@@ -663,6 +744,15 @@ def cleanup-local-e2e-processes [] {
     stop-local-e2e-systemd-scopes
     stop-e2e-processes-gracefully
     stop-tracy-capture
+}
+
+def chown-to-current-user [path: string] {
+    if (^uname | str trim) != "Linux" or not ($path | path exists) {
+        return
+    }
+    let uid = (id -u | str trim)
+    let gid = (id -g | str trim)
+    sudo chown -R $"($uid):($gid)" $path | ignore
 }
 
 def rpc-block-number [url: string] {
@@ -891,9 +981,9 @@ def run-local-e2e-phase [run: record, ctx: record] {
             exit 1
         }
     }
-    if $hardfork != "" or $ctx.gas_limit != "" {
-        e2e-regenesis $ctx.regenesis_tempo $genesis $ctx.a.datadir $hardfork $ctx.gas_limit
-        e2e-regenesis $ctx.regenesis_tempo $genesis $ctx.b.datadir $hardfork $ctx.gas_limit
+    if $hardfork != "" or $ctx.gas_limit != "" or $ctx.general_gas_limit != "" {
+        e2e-regenesis $ctx.regenesis_tempo $genesis $ctx.a.datadir $hardfork $ctx.gas_limit $ctx.general_gas_limit
+        e2e-regenesis $ctx.regenesis_tempo $genesis $ctx.b.datadir $hardfork $ctx.gas_limit $ctx.general_gas_limit
     }
     for role_info in [
         { role: "a", node_dir: $ctx.a.node_dir }
@@ -920,6 +1010,7 @@ def run-local-e2e-phase [run: record, ctx: record] {
         $"($ctx.results_dir)/profile-($phase)-a.json.gz"
         $"($ctx.results_dir)/profile-($phase)-b.json.gz"
         $"($ctx.results_dir)/tracy-profile-($phase).tracy"
+        $"($ctx.results_dir)/tracy-capture-($phase).log"
         $"($ctx.results_dir)/logs-($phase)-a"
         $"($ctx.results_dir)/logs-($phase)-b"
     ] {
@@ -944,16 +1035,14 @@ def run-local-e2e-phase [run: record, ctx: record] {
         | append (log-filter-args $ctx.loud)
         | append (if $ctx.gas_limit != "" { ["--builder.gaslimit" $ctx.gas_limit] } else { [] })
         | append (if $ctx.samply { ["--log.samply"] } else { [] })
-        | append (if $ctx.tracy != "off" { ["--log.tracy" "--log.tracy.filter" $ctx.tracy_filter] } else { [] })
         | append (if $ctx.tracing_otlp != "" { [$"--tracing-otlp=($ctx.tracing_otlp)"] } else { [] })
     let a_args = (dedup-args $a_base_args $extra_args)
     let b_args = (dedup-args $b_base_args $extra_args)
 
-    let tracy_env_prefix = if $ctx.tracy == "on" {
-        "TRACY_NO_SYS_TRACE=1 "
-    } else if $ctx.tracy == "full" {
-        "TRACY_SAMPLING_HZ=1 "
-    } else { "" }
+    if $ctx.tracy != "off" {
+        print $"  Tracy mode: ($ctx.tracy), sampling hz: ($TRACY_SAMPLING_HZ)"
+    }
+    let tracy_env_prefix = if $ctx.tracy != "off" { $"TRACY_SAMPLING_HZ=($TRACY_SAMPLING_HZ) " } else { "" }
     let env_prefix = if $side_env != "" { $"($side_env) " } else { "" }
     let a_otel = $"OTEL_RESOURCE_ATTRIBUTES=benchmark_id=($ctx.benchmark_id),benchmark_run=($phase),runner_role=a,run_type=($run_type),git_ref=($run.ref),reference_epoch=($ctx.reference_epoch) "
     let b_otel = $"OTEL_RESOURCE_ATTRIBUTES=benchmark_id=($ctx.benchmark_id),benchmark_run=($phase),runner_role=b,run_type=($run_type),git_ref=($run.ref),reference_epoch=($ctx.reference_epoch) "
@@ -962,7 +1051,7 @@ def run-local-e2e-phase [run: record, ctx: record] {
     mark-schelk-dirty-at $ctx.b.state_path
 
     start-e2e-local-node a $phase $run.tempo $a_args $env_prefix $a_otel $tracy_env_prefix $ctx.samply $ctx.samply_args $ctx.results_dir $ctx.a.cpus $ctx.a.memory
-    start-e2e-local-node b $phase $run.tempo $b_args $env_prefix $b_otel $tracy_env_prefix $ctx.samply $ctx.samply_args $ctx.results_dir $ctx.b.cpus $ctx.b.memory
+    start-e2e-local-node b $phase $run.tempo $b_args $env_prefix $b_otel "" $ctx.samply $ctx.samply_args $ctx.results_dir $ctx.b.cpus $ctx.b.memory
 
     sleep 2sec
     let rpc_timeout = if $ctx.bloat > 0 { 600 } else { 300 }
@@ -979,16 +1068,27 @@ def run-local-e2e-phase [run: record, ctx: record] {
     if $phase_exit == 0 and not (e2e-wait-for-chain-advance $b_rpc 300) { $phase_exit = 1 }
 
     let tracy_output = $"($ctx.results_dir)/tracy-profile-($phase).tracy"
+    let tracy_log = $"($ctx.results_dir)/tracy-capture-($phase).log"
     mut tracy_capture_started = false
+    mut tracy_capture_job = 0
     if $phase_exit == 0 and $ctx.tracy != "off" {
         let seconds_flag = if $ctx.tracy_seconds > 0 { $"-s ($ctx.tracy_seconds)" } else { "" }
         let limit_msg = if $ctx.tracy_seconds > 0 { $" \(($ctx.tracy_seconds)s limit\)" } else { "" }
+        let capture_path = ($env.PATH | str join (char esep))
+        let capture_cmd = $"sudo env PATH=($capture_path) TRACY_SAMPLING_HZ=($TRACY_SAMPLING_HZ) tracy-capture -f -o ($tracy_output) ($seconds_flag) >($tracy_log) 2>&1"
         if $ctx.tracy_offset > 0 {
-            print $"  Tracy-capture will start in ($ctx.tracy_offset)s($limit_msg)..."
-            job spawn { sleep ($"($ctx.tracy_offset)sec" | into duration); sh -c $"tracy-capture -f -o ($tracy_output) ($seconds_flag)" }
+            print $"  Tracy-capture will start after ($ctx.tracy_offset) seconds($limit_msg)..."
+            $tracy_capture_job = (job spawn {
+                sleep ($"($ctx.tracy_offset)sec" | into duration)
+                let result = (sh -c $capture_cmd | complete)
+                { phase: $phase, exit_code: $result.exit_code } | job send --tag 18999 0
+            })
         } else {
             print $"  Starting tracy-capture($limit_msg)..."
-            job spawn { sh -c $"tracy-capture -f -o ($tracy_output) ($seconds_flag)" }
+            $tracy_capture_job = (job spawn {
+                let result = (sh -c $capture_cmd | complete)
+                { phase: $phase, exit_code: $result.exit_code } | job send --tag 18999 0
+            })
             sleep 500ms
         }
         $tracy_capture_started = true
@@ -1001,9 +1101,12 @@ def run-local-e2e-phase [run: record, ctx: record] {
     } else {
         ""
     }
+    let metrics_urls = ["a:http://127.0.0.1:9001/metrics" "b:http://127.0.0.1:9101/metrics"]
+        | append (if $ctx.runner_metrics_url != "" { [$"runner:($ctx.runner_metrics_url)"] } else { [] })
 
     if $phase_exit == 0 {
         let phase_started_ms = ((date now | into int) / 1_000_000 | into int)
+        let initial_db_size_bytes = (e2e-db-size-bytes $ctx.a.datadir)
         let sender_exit = (try {
             let bench_result = (txgen-run-preset-pipeline
                 --txgen-tempo-bin $ctx.txgen.txgen_tempo_bin
@@ -1011,7 +1114,7 @@ def run-local-e2e-phase [run: record, ctx: record] {
                 --preset-path $ctx.preset_path
                 --generate-rpc-url $a_rpc
                 --submit-rpc-url $a_rpc
-                --metrics-url ["a:http://127.0.0.1:9001/metrics" "b:http://127.0.0.1:9101/metrics"]
+                --metrics-url $metrics_urls
                 --report-path $"($ctx.results_dir)/report-($phase).json"
                 --tps $ctx.tps
                 --duration $ctx.duration
@@ -1032,6 +1135,7 @@ def run-local-e2e-phase [run: record, ctx: record] {
                 --bloat-mib $ctx.bloat
                 --tip20-token-count $ctx.token_count
                 --bloat-token-count ($TIP20_TOKEN_IDS | length)
+                --initial-db-size-bytes $initial_db_size_bytes
                 --victoriametrics-url $ctx.victoriametrics_url
                 --clickhouse-url $phase_clickhouse_url
                 --skip-funding=($ctx.bloat > 0))
@@ -1064,10 +1168,28 @@ def run-local-e2e-phase [run: record, ctx: record] {
     }
 
     if $tracy_capture_started {
-        stop-tracy-capture
+        print "  Stopping validators before tracy-capture so Tracy can record graceful node shutdown..."
     }
     stop-e2e-processes-gracefully
+    if $tracy_capture_started {
+        stop-tracy-capture
+        if $tracy_capture_job > 0 {
+            wait-for-tracy-capture-exit $tracy_capture_job $phase
+        }
+        if not ($tracy_output | path exists) {
+            print $"  Warning: tracy-capture did not write ($tracy_output)"
+            if ($tracy_log | path exists) {
+                print $"  tracy-capture log for ($phase):"
+                open $tracy_log | lines | each { |line| print $"    ($line)" }
+            } else {
+                print $"  Warning: tracy-capture log not found: ($tracy_log)"
+            }
+        }
+    }
     if $ctx.samply { wait-for-samply-profile }
+    chown-to-current-user $ctx.results_dir
+    chown-to-current-user $a_log_dir
+    chown-to-current-user $b_log_dir
     if ($a_log_dir | path exists) { cp -r $a_log_dir $"($ctx.results_dir)/logs-($phase)-a" }
     if ($b_log_dir | path exists) { cp -r $b_log_dir $"($ctx.results_dir)/logs-($phase)-b" }
     restore-system-tuning $tuning_state
@@ -1079,10 +1201,14 @@ def run-local-e2e-phase [run: record, ctx: record] {
     return 0
 }
 
-def e2e-run-sides [run_pairs: int] {
+def e2e-run-sides [run_pairs: int, run_side: string] {
     if $run_pairs <= 0 {
         print "Error: --run-pairs must be a positive integer"
         exit 1
+    }
+
+    if $run_side == "feature" {
+        return (0..<$run_pairs | each { "feature" })
     }
 
     mut sides = []
@@ -1110,6 +1236,7 @@ def e2e-write-summary-config [
     benchmark_id: string
     reference_epoch: int
     summary_warmup_blocks: int
+    run_side: string
     baseline_hardfork: string
     feature_hardfork: string
     baseline_removed_args: string
@@ -1126,6 +1253,7 @@ def e2e-write-summary-config [
         benchmark_id: $benchmark_id
         reference_epoch: $reference_epoch
         summary_warmup_blocks: $summary_warmup_blocks
+        run_side: $run_side
         baseline_hardfork: $baseline_hardfork
         feature_hardfork: $feature_hardfork
         baseline_removed_args: $baseline_removed_args
@@ -1144,6 +1272,7 @@ def e2e-generate-summary [results_dir: string] {
     let baseline_hardfork = ($config | get -o baseline_hardfork | default "")
     let feature_hardfork = ($config | get -o feature_hardfork | default "")
     let summary_warmup_blocks = ($config | get -o summary_warmup_blocks | default 0 | into int)
+    let run_side = ($config | get -o run_side | default "comparison")
     generate-summary $results_dir $config.baseline_label $config.feature_label ($config.bloat_mib | into int) $config.preset ($config.tps | into int) ($config.duration | into int) --benchmark-id ($config.benchmark_id | default "") --reference-epoch ($config.reference_epoch | default 0 | into int) --baseline-hardfork $baseline_hardfork --feature-hardfork $feature_hardfork --summary-warmup-blocks $summary_warmup_blocks
     let summary_path = $"($results_dir)/summary.json"
     if ($summary_path | path exists) {
@@ -1151,7 +1280,7 @@ def e2e-generate-summary [results_dir: string] {
         let feature_removed_args = ($config | get -o feature_removed_args | default "")
         let token_count = ($config | get -o token_count | default 4 | into int)
         let summary = (open $summary_path)
-        let summary = ($summary | upsert config ($summary.config | upsert token_count $token_count | upsert baseline_removed_args $baseline_removed_args | upsert feature_removed_args $feature_removed_args))
+        let summary = ($summary | upsert config ($summary.config | upsert token_count $token_count | upsert run_side $run_side | upsert baseline_removed_args $baseline_removed_args | upsert feature_removed_args $feature_removed_args))
         $summary | to json | save -f $summary_path
     }
 
@@ -1187,6 +1316,7 @@ def "main e2e" [
     --bloat: int = $E2E_DEFAULT_BLOAT                   # State bloat snapshot size in GiB: 0, 1, 10, or 100
     --token-count: int = 4                         # Number of TIP20 tokens to use in txgen presets
     --gas-limit: string = $E2E_GAS_LIMIT                # Builder gas limit
+    --general-gas-limit: string = ""                    # General (non-payment) gas limit override
     --force-bloat                                      # Regenerate and promote both local e2e snapshots
     --init-only                                         # Refresh snapshots and exit without running benchmark phases
     --profile: string = $DEFAULT_PROFILE                # Cargo build profile
@@ -1196,15 +1326,17 @@ def "main e2e" [
     --no-default-features                               # Disable Cargo default features
     --samply                                            # Profile validators with samply
     --samply-args: string = ""                          # Additional samply arguments
-    --tracy: string = "off"                             # Tracy profiling: off, on, full
+    --tracy: string = "off"                             # Tracy profiling: off, tracy
     --tracy-filter: string = "debug"                    # Tracy tracing filter level
-    --tracy-seconds: int = 30                           # Tracy capture duration limit in seconds
-    --tracy-offset: int = 120                           # Seconds to wait before starting tracy capture
+    --tracy-seconds: int = 0                            # Tracy capture duration limit in seconds; 0 captures until stopped
+    --tracy-offset: int = 0                             # Seconds to wait before starting tracy capture
     --tracing-otlp: string = ""                         # OTLP endpoint for tracing (auto-derived from GRAFANA_TEMPO/TEMPO_TELEMETRY_URL)
     --victoriametrics-url: string = ""                  # VictoriaMetrics base URL for txgen metric sample import
     --clickhouse-url: string = ""                       # ClickHouse HTTP endpoint for txgen result upload
     --clickhouse-run: string = "feature-1"              # Run label allowed to use the ClickHouse reporter; empty = every run
+    --runner-metrics-url: string = $E2E_RUNNER_METRICS_URL # Runner node-exporter metrics URL (empty disables runner metrics)
     --run-pairs: int = 3                                # Number of baseline/feature run pairs
+    --run-side: string = "comparison"                   # Phases to run: comparison or feature
     --run-type: string = ""                             # Run type label (dispatch, nightly, release)
     --baseline-args: string = ""                        # Additional node args for baseline phases
     --feature-args: string = ""                         # Additional node args for feature phases
@@ -1225,12 +1357,16 @@ def "main e2e" [
 ] {
     let preset_path = (txgen-preset-path $preset)
     txgen-validate-bench-args $bench_args
-    if $tracy not-in ["off" "on" "full"] {
-        print $"Error: --tracy must be one of: off, on, full \(got '($tracy)'\)"
+    if $tracy not-in ["off" "tracy"] {
+        print $"Error: --tracy must be one of: off, tracy \(got '($tracy)'\)"
         exit 1
     }
     if $run_pairs <= 0 {
         print "Error: --run-pairs must be a positive integer"
+        exit 1
+    }
+    if $run_side not-in ["comparison" "feature"] {
+        print $"Error: --run-side must be one of: comparison, feature \(got '($run_side)'\)"
         exit 1
     }
     if $summary_warmup_blocks < 0 {
@@ -1298,6 +1434,7 @@ def "main e2e" [
     }
     let reference_epoch = (($run_started_at | into int) / 1_000_000_000 | into int)
     let gas_limit_args = if $gas_limit != "" { ["--gas-limit" $gas_limit] } else { [] }
+    let general_gas_limit_args = if $general_gas_limit != "" { ["--general-gas-limit" $general_gas_limit] } else { [] }
     let tracing_otlp = (derive-tracing-otlp $tracing_otlp)
     if $tracing_otlp != "" {
         $env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT = $tracing_otlp
@@ -1339,7 +1476,7 @@ def "main e2e" [
         let tempo_bin = if $profile == "dev" { "./target/debug/tempo" } else { $"./target/($profile)/tempo" }
         let genesis_accounts = ([$accounts 3] | math max) + 1
         print $"Generating local e2e localnet config for validators: ($E2E_VALIDATORS)"
-        cargo run -p tempo-xtask --profile $profile -- generate-localnet -o $init_dir --accounts $genesis_accounts --validators $E2E_VALIDATORS --seed $E2E_SEED --force ...$gas_limit_args ...$snapshot_hardfork_args
+        cargo run -p tempo-xtask --profile $profile -- generate-localnet -o $init_dir --accounts $genesis_accounts --validators $E2E_VALIDATORS --seed $E2E_SEED --force ...$gas_limit_args ...$general_gas_limit_args ...$snapshot_hardfork_args
 
         let trusted_peers = (trusted-peers-from-localnet $init_dir)
         if $trusted_peers == "" {
@@ -1360,6 +1497,7 @@ def "main e2e" [
             validators: $E2E_VALIDATORS
             seed: $E2E_SEED
             gas_limit: $gas_limit
+            general_gas_limit: $general_gas_limit
             dkg_in_genesis: true
             topology: "single-runner"
             state_hardfork: $snapshot_state_hardfork
@@ -1385,8 +1523,8 @@ def "main e2e" [
     if $hardfork_mode {
         if ($hardfork_genesis_dir | path exists) { rm -rf $hardfork_genesis_dir }
         mkdir $hardfork_genesis_dir
-        e2e-synthesize-genesis $genesis_path $baseline_genesis_path $baseline_hardfork_name $gas_limit
-        e2e-synthesize-genesis $genesis_path $feature_genesis_path $feature_hardfork_name $gas_limit
+        e2e-synthesize-genesis $genesis_path $baseline_genesis_path $baseline_hardfork_name $gas_limit $general_gas_limit
+        e2e-synthesize-genesis $genesis_path $feature_genesis_path $feature_hardfork_name $gas_limit $general_gas_limit
     }
     let trusted_peers = if ($a_trusted_peers_path | path exists) {
         open $a_trusted_peers_path | str trim
@@ -1408,41 +1546,33 @@ def "main e2e" [
     mkdir $BENCH_WORKTREES_DIR
     let baseline_wt = $"($BENCH_WORKTREES_DIR)/e2e-local-baseline"
     let feature_wt = $"($BENCH_WORKTREES_DIR)/e2e-local-feature"
-    let regenesis_wt = $"($BENCH_WORKTREES_DIR)/e2e-local-regenesis-main"
-    let regenesis_needed = $hardfork_mode or $gas_limit != ""
-    for wt in [$baseline_wt $feature_wt $regenesis_wt] {
+    let regenesis_needed = $hardfork_mode or $gas_limit != "" or $general_gas_limit != ""
+    let needs_baseline = $run_side == "comparison"
+    let worktrees = if $needs_baseline { [$baseline_wt $feature_wt] } else { [$feature_wt] }
+    for wt in $worktrees {
         if ($wt | path exists) {
             print $"Removing stale local e2e worktree: ($wt)"
             try { git worktree remove --force $wt } catch { rm -rf $wt }
         }
     }
-    git worktree add $baseline_wt $baseline
-    git worktree add $feature_wt $feature
-    if $regenesis_needed {
-        print "Fetching latest origin/main for tempo regenesis..."
-        git fetch origin main
-        git worktree add $regenesis_wt origin/main
+    if $needs_baseline {
+        git worktree add $baseline_wt $baseline
     }
+    git worktree add $feature_wt $feature
 
     let global_build_features = (merge-e2e-features $DEFAULT_FEATURES $features)
     let baseline_build_features = if $baseline_features != "" { merge-e2e-features $global_build_features $baseline_features } else { $global_build_features }
     let feature_build_features = if $feature_features != "" { merge-e2e-features $global_build_features $feature_features } else { $global_build_features }
     let baseline_tbc = (tracy-build-config $baseline_build_features $tracy)
     let feature_tbc = (tracy-build-config $feature_build_features $tracy)
-    let regenesis_build_features = $global_build_features
-    let regenesis_tbc = (tracy-build-config $regenesis_build_features $tracy)
     let effective_no_cache = $no_cache or ($tracy != "off")
-    # Build benchmark binaries in parallel. Regenesis uses latest origin/main so
-    # snapshot rewriting is independent of either side being benchmarked.
-    # with independent target/ directories, so cargo invocations don't collide.
-    mut builds = [
-        { wt: $baseline_wt, ref_name: $baseline, sha: $baseline, label: "baseline", features: $baseline_tbc.features, extra_rustflags: $baseline_tbc.extra_rustflags, bench_features: $baseline_build_features }
-        { wt: $feature_wt, ref_name: $feature, sha: $feature, label: "feature", features: $feature_tbc.features, extra_rustflags: $feature_tbc.extra_rustflags, bench_features: $feature_build_features }
-    ]
-    let regenesis_sha = if $regenesis_needed { git rev-parse origin/main | str trim } else { "" }
-    if $regenesis_needed {
-        $builds = ($builds | append { wt: $regenesis_wt, ref_name: "origin/main", sha: $regenesis_sha, label: "regenesis-main", features: $regenesis_tbc.features, extra_rustflags: $regenesis_tbc.extra_rustflags, bench_features: $regenesis_build_features })
+    # Build benchmark binaries in parallel with independent target/ directories,
+    # so cargo invocations don't collide.
+    mut builds = []
+    if $needs_baseline {
+        $builds = ($builds | append { wt: $baseline_wt, ref_name: $baseline, sha: $baseline, label: "baseline", features: $baseline_tbc.features, extra_rustflags: $baseline_tbc.extra_rustflags, bench_features: $baseline_build_features })
     }
+    $builds = ($builds | append { wt: $feature_wt, ref_name: $feature, sha: $feature, label: "feature", features: $feature_tbc.features, extra_rustflags: $feature_tbc.extra_rustflags, bench_features: $feature_build_features })
     $builds | par-each { |b|
         if $effective_no_cache {
             build-in-worktree --no-cache --no-default-features=$no_default_features --extra-rustflags $b.extra_rustflags --bench-features $b.bench_features $b.wt $b.ref_name $profile $b.features $b.sha
@@ -1450,10 +1580,10 @@ def "main e2e" [
             build-in-worktree --no-default-features=$no_default_features $b.wt $b.ref_name $profile $b.features $b.sha
         }
     } | ignore
-    let baseline_tempo = (worktree-bin $baseline_wt $profile "tempo")
+    let baseline_tempo = if $needs_baseline { worktree-bin $baseline_wt $profile "tempo" } else { "" }
     let feature_tempo = (worktree-bin $feature_wt $profile "tempo")
-    let regenesis_tempo = if $regenesis_needed { worktree-bin $regenesis_wt $profile "tempo" } else { "" }
-    let baseline_arg_filter = (supported-node-arg-filter $baseline_tempo $E2E_LOCAL_RETH_ARGS)
+    let regenesis_tempo = if $regenesis_needed { $feature_tempo } else { "" }
+    let baseline_arg_filter = if $needs_baseline { supported-node-arg-filter $baseline_tempo $E2E_LOCAL_RETH_ARGS } else { { supported: [], removed: [] } }
     let feature_arg_filter = (supported-node-arg-filter $feature_tempo $E2E_LOCAL_RETH_ARGS)
     let removed_arg_config = $"(format-removed-node-arg-config 'baseline' $baseline_arg_filter.removed)(format-removed-node-arg-config 'feature' $feature_arg_filter.removed)"
     if $removed_arg_config != "" {
@@ -1516,12 +1646,14 @@ def "main e2e" [
         victoriametrics_url: $victoriametrics_url
         clickhouse_url: $clickhouse_url
         clickhouse_run: $clickhouse_run
+        runner_metrics_url: $runner_metrics_url
         run_type: $run_type
         benchmark_id: $benchmark_id
         reference_epoch: $reference_epoch
         tune: $tune
         loud: $loud
         gas_limit: $gas_limit
+        general_gas_limit: $general_gas_limit
         baseline_local_reth_args: $baseline_arg_filter.supported
         feature_local_reth_args: $feature_arg_filter.supported
         regenesis_tempo: $regenesis_tempo
@@ -1534,7 +1666,7 @@ def "main e2e" [
     mut baseline_run_index = 0
     mut feature_run_index = 0
     mut runs = []
-    for side in (e2e-run-sides $run_pairs) {
+    for side in (e2e-run-sides $run_pairs $run_side) {
         if $side == "baseline" {
             $baseline_run_index = $baseline_run_index + 1
             $runs = ($runs | append {
@@ -1563,7 +1695,7 @@ def "main e2e" [
         exit 1
     }
     $valid_run_labels | str join "\n" | save -f $"($results_dir)/run-order.txt"
-    e2e-write-summary-config $results_dir $baseline_base_label $feature_base_label $bloat_mib $token_count $preset $tps $duration $benchmark_id $reference_epoch $summary_warmup_blocks $baseline_hardfork_name $feature_hardfork_name (removed-node-args-label $baseline_arg_filter.removed) (removed-node-args-label $feature_arg_filter.removed)
+    e2e-write-summary-config $results_dir $baseline_base_label $feature_base_label $bloat_mib $token_count $preset $tps $duration $benchmark_id $reference_epoch $summary_warmup_blocks $run_side $baseline_hardfork_name $feature_hardfork_name (removed-node-args-label $baseline_arg_filter.removed) (removed-node-args-label $feature_arg_filter.removed)
     let num_phases = ($runs | length)
     mut e2e_exit = 0
     for idx in 0..<$num_phases {
@@ -1593,9 +1725,10 @@ def "main e2e" [
         print "\nUploading local e2e tracy profiles to R2..."
         for run in $runs {
             let profile = $"($results_dir)/tracy-profile-($run.phase).tracy"
-            let viewer_url = (upload-tracy-profile $profile $run.phase $run.ref)
-            if $viewer_url != null {
-                $viewer_url | save -f $"($results_dir)/tracy-($run.phase)-url.txt"
+            let tracy_urls = (upload-tracy-profile $profile $run.phase $run.ref)
+            if $tracy_urls != null {
+                $tracy_urls.viewer_url | save -f $"($results_dir)/tracy-($run.phase)-url.txt"
+                $tracy_urls.profile_url | save -f $"($results_dir)/tracy-($run.phase)-profile-url.txt"
             }
         }
     }
@@ -1609,9 +1742,10 @@ def "main e2e" [
         }
     }
 
-    try { git worktree remove --force $baseline_wt } catch { }
+    if $needs_baseline {
+        try { git worktree remove --force $baseline_wt } catch { }
+    }
     try { git worktree remove --force $feature_wt } catch { }
-    try { git worktree remove --force $regenesis_wt } catch { }
     cleanup-local-e2e-processes
     bench-restore-at $E2E_A_STATE_PATH $E2E_A_MOUNT $a_db
     bench-restore-at $E2E_B_STATE_PATH $E2E_B_MOUNT $b_db
