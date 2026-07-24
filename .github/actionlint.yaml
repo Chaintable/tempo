@@ -10,3 +10,7 @@ self-hosted-runner:
     - depot-macos-15
     - Linux
     - X64
+    - self-hosted
+    - general
+    - amd64
+    - arm64
