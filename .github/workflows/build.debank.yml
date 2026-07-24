@@ -29,9 +29,9 @@ jobs:
       - name: Set env (determine image tag)
         run: |
           if [[ "${{ github.event_name }}" == "release" ]]; then
-            echo "REVISION=${GITHUB_REF#refs/*/}" >> $GITHUB_ENV
+            echo "REVISION=${GITHUB_REF#refs/*/}" >> "$GITHUB_ENV"
           else
-            echo "REVISION=$(git rev-parse --short=7 HEAD)" >> $GITHUB_ENV
+            echo "REVISION=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_ENV"
           fi
 
       - name: Configure AWS Credentials
@@ -41,10 +41,10 @@ jobs:
 
       - name: Login to Amazon ECR
         id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
+        uses: aws-actions/amazon-ecr-login@b040164c4934333d597f3f9c67502ff28f814e9c # v2.1.6
 
       - name: Build and push image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5.4.0
         with:
           file: ${{ env.DOCKERFILE }}
           context: .
