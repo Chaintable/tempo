@@ -70,13 +70,13 @@ jobs:
 
       - name: Merge manifest
         run: |
-          docker pull --platform=linux/amd64 ${REGISTRY}/${IMAGE}:amd64-${REVISION}
-          docker pull --platform=linux/arm64 ${REGISTRY}/${IMAGE}:arm64-${REVISION}
-          docker buildx imagetools create --tag ${REGISTRY}/${IMAGE}:${REVISION} ${REGISTRY}/${IMAGE}:amd64-${REVISION} ${REGISTRY}/${IMAGE}:arm64-${REVISION}
-          docker rmi ${REGISTRY}/${IMAGE}:amd64-${REVISION}
-          docker rmi ${REGISTRY}/${IMAGE}:arm64-${REVISION}
+          docker pull --platform=linux/amd64 "${REGISTRY}/${IMAGE}:amd64-${REVISION}"
+          docker pull --platform=linux/arm64 "${REGISTRY}/${IMAGE}:arm64-${REVISION}"
+          docker buildx imagetools create --tag "${REGISTRY}/${IMAGE}:${REVISION}" "${REGISTRY}/${IMAGE}:amd64-${REVISION}" "${REGISTRY}/${IMAGE}:arm64-${REVISION}"
+          docker rmi "${REGISTRY}/${IMAGE}:amd64-${REVISION}"
+          docker rmi "${REGISTRY}/${IMAGE}:arm64-${REVISION}"
 
       - name: Lark Notification
         continue-on-error: true
         run: |
-          notiv3 "Blockchain tempo released" ${REGISTRY}/${IMAGE}:${REVISION}
+          notiv3 "Blockchain tempo released" "${REGISTRY}/${IMAGE}:${REVISION}"
