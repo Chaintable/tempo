@@ -44,6 +44,9 @@ jobs:
           push: true
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE }}:${{ matrix.arch }}-${{ env.REVISION }}
           provenance: false
+          build-args: |
+            VERGEN_GIT_SHA=${{ github.sha }}
+            VERGEN_GIT_SHA_SHORT=${{ github.sha }}
 
   merge-docker-manifest:
     runs-on: [ self-hosted, general ]
