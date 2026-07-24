@@ -74,7 +74,10 @@ pub use tempo_node::{
 use tempo_node::{
     TempoFullNode,
     rpc::consensus::{TempoConsensusApiServer, TempoConsensusRpc},
-    telemetry::{PrometheusMetricsConfig, install_prometheus_metrics},
+    telemetry::{
+        HardwareMetricsConfig, PrometheusMetricsConfig, install_hardware_metrics,
+        install_prometheus_metrics,
+    },
 };
 use tokio::sync::oneshot;
 use tracing::{debug, info, info_span, warn, warn_span};
@@ -250,10 +253,6 @@ pub fn tempo_main_with(mut overrides: TempoOverrides) -> eyre::Result<()> {
 
         // Set Reth logs OTLP. Consensus logs are exported as well via the same tracing system.
         cli.traces.logs_otlp = Some(config.logs_otlp_url.clone());
-        cli.traces.logs_otlp_filter = config
-            .logs_otlp_filter
-            .parse()
-            .wrap_err("invalid default logs filter")?;
 
         telemetry_config = Some(config);
     }
@@ -281,21 +280,29 @@ pub fn tempo_main_with(mut overrides: TempoOverrides) -> eyre::Result<()> {
                 and a handle to the execution node could be received",
         )?;
 
+        let datadir = node
+            .config
+            .datadir
+            .clone()
+            .resolve_datadir(node.chain_spec().chain());
+        let consensus_storage = args
+            .consensus
+            .storage_dir
+            .clone()
+            .unwrap_or_else(|| datadir.data_dir().join("consensus"));
+
+        install_hardware_metrics(HardwareMetricsConfig {
+            datadir: datadir.data_dir().to_path_buf(),
+            static_files_dir: datadir.static_files(),
+            consensus_dir: consensus_storage.clone(),
+        });
+
         if !args.has_consensus_engine(node.config.dev.dev) {
             return futures::executor::block_on(async move {
                 shutdown_token_clone.cancelled().await;
                 Ok(())
             });
         }
-
-        let consensus_storage = args.consensus.storage_dir.clone().unwrap_or_else(|| {
-            node.config
-                .datadir
-                .clone()
-                .resolve_datadir(node.chain_spec().chain())
-                .data_dir()
-                .join("consensus")
-        });
 
         info_span!("prepare_consensus").in_scope(|| {
             info!(
@@ -718,6 +725,7 @@ mod tests {
         assert_eq!(node_cmd.builder.max_payload_tasks, 1);
         assert!(!node_cmd.ext.node_args.builder_disable_prewarming);
         assert!(node_cmd.ext.node_args.builder_enable_prewarming);
+        assert!(!node_cmd.ext.node_args.builder_parallel);
         assert_eq!(
             node_cmd.ext.consensus.target_block_time.into_duration(),
             Duration::from_millis(550)
@@ -781,6 +789,20 @@ mod tests {
             panic!("expected node command");
         };
         assert!(node_cmd.ext.node_args.builder_disable_prewarming);
+
+        let cli =
+            TempoCli::try_parse_from(["tempo", "node", "--dev", "--builder.parallel"]).unwrap();
+        let Commands::Node(node_cmd) = cli.command else {
+            panic!("expected node command");
+        };
+        assert!(node_cmd.ext.node_args.builder_parallel);
+        assert!(
+            node_cmd
+                .ext
+                .node_args
+                .payload_builder_builder()
+                .enable_parallel
+        );
 
         let cli = TempoCli::try_parse_from([
             "tempo",

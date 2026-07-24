@@ -25,6 +25,8 @@ alloy = { workspace = true, features = ["sol-types", "consensus"] }
 alloy-evm = { workspace = true, features = ["std"] }
 alloy-primitives = { workspace = true, features = ["map-foldhash"] }
 revm.workspace = true
+paste.workspace = true
+bitflags.workspace = true
 
 commonware-cryptography.workspace = true
 commonware-codec.workspace = true

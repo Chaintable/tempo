@@ -30,18 +30,10 @@ on:
         required: false
         default: ""
       preset:
-        description: Benchmark preset.
-        type: choice
+        description: Benchmark preset or scenario, e.g. default or tip20:recipient=existing,auth=keychain.
+        type: string
         required: true
-        default: tip20_existing_recipients
-        options:
-          - tip20
-          - tip20_2d_nonces
-          - tip20_protocol_nonces
-          - tip20_random_recipients
-          - tip20_existing_recipients
-          - mpp
-          - mix
+        default: default
       duration:
         description: Benchmark duration in seconds.
         type: string
@@ -116,12 +108,12 @@ on:
         description: Builder gas limit.
         type: string
         required: true
-        default: "5000000000"
+        default: "1000000000000"
       general-gas-limit:
         description: General non-payment gas limit override.
         type: string
         required: false
-        default: ""
+        default: "1000000000000"
       force-bloat:
         description: Force regeneration of local benchmark state.
         type: boolean
@@ -167,7 +159,7 @@ on:
       preset:
         type: string
         required: false
-        default: tip20_existing_recipients
+        default: default
       duration:
         type: string
         required: false
@@ -252,6 +244,10 @@ on:
         type: string
         required: false
         default: "false"
+      skip-state-root:
+        type: string
+        required: false
+        default: "false"
       baseline-args:
         type: string
         required: false
@@ -263,11 +259,11 @@ on:
       gas-limit:
         type: string
         required: false
-        default: "5000000000"
+        default: "1000000000000"
       general-gas-limit:
         type: string
         required: false
-        default: ""
+        default: "1000000000000"
       run-type:
         type: string
         required: false
@@ -393,8 +389,9 @@ jobs:
       BENCH_FEATURE_FEATURES: ${{ inputs.feature-features }}
       BENCH_BASELINE_ARGS: ${{ inputs.baseline-args }}
       BENCH_FEATURE_ARGS: ${{ inputs.feature-args }}
-      BENCH_GAS_LIMIT: ${{ inputs.gas-limit || '5000000000' }}
-      BENCH_GENERAL_GAS_LIMIT: ${{ inputs.general-gas-limit }}
+      BENCH_SKIP_STATE_ROOT: ${{ inputs.skip-state-root == true || inputs.skip-state-root == 'true' }}
+      BENCH_GAS_LIMIT: ${{ inputs.gas-limit || '1000000000000' }}
+      BENCH_GENERAL_GAS_LIMIT: ${{ inputs.general-gas-limit || '1000000000000' }}
       BENCH_RUN_TYPE: ${{ inputs.run-type || 'dispatch' }}
       BENCH_FORCE_BLOAT: ${{ inputs.force-bloat || 'false' }}
       BENCH_NO_CACHE: ${{ inputs.no-cache || 'false' }}
@@ -505,6 +502,20 @@ jobs:
           persist-credentials: false
           token: ${{ secrets.DEREK_BENCH_TOKEN || github.token }}
 
+      - name: Render txgen spec
+        run: |
+          rm -rf .bench-tmp/txgen-specs
+          spec_path="$(nu bench-e2e.nu render-txgen-spec --preset "$BENCH_PRESET" --out-dir ".bench-tmp/txgen-specs" | tail -n 1)"
+          if [ -z "$spec_path" ] || [ ! -f "$spec_path" ]; then
+            echo "::error::failed to render txgen spec for preset '$BENCH_PRESET'"
+            exit 1
+          fi
+
+          echo "BENCH_TXGEN_SPEC_PATH=$spec_path" >> "$GITHUB_ENV"
+          echo "::group::Rendered txgen spec ($BENCH_PRESET)"
+          cat "$spec_path"
+          echo "::endgroup::"
+
       - name: Resolve Tracy capture offset
         if: env.BENCH_TRACY != 'off'
         run: |
@@ -582,12 +593,12 @@ jobs:
               body: buildBody('Resolving refs...'),
             });
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
       - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
         continue-on-error: true
 
       - name: Install Node.js
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
           node-version: 24
 
@@ -716,7 +727,7 @@ jobs:
              } catch {
                baselineRef = process.env.INPUT_SHA;
              }
-             baselineName = baselineNameArg || baseRef;
+             baselineName = baselineNameArg && baselineNameArg !== 'merge-base' ? baselineNameArg : baselineRef;
            }
 
            if (featureArg) {
@@ -843,6 +854,8 @@ jobs:
         env:
           BASELINE_REF: ${{ steps.refs.outputs.baseline-ref }}
           FEATURE_REF: ${{ steps.refs.outputs.feature-ref }}
+          BASELINE_NAME: ${{ steps.refs.outputs.baseline-name }}
+          FEATURE_NAME: ${{ steps.refs.outputs.feature-name }}
           BENCH_GH_TOKEN: ${{ secrets.DEREK_BENCH_TOKEN }}
         run: |
           if [ "$BENCH_OTLP" != "true" ]; then
@@ -855,9 +868,12 @@ jobs:
             echo "::error::run-pairs must be a positive integer"
             exit 1
           fi
-          if [ "$BENCH_RUN_SIDE" != "comparison" ] && [ "$BENCH_RUN_SIDE" != "feature" ]; then
-            echo "::error::run-side must be one of: comparison, feature"
+          if [ "$BENCH_RUN_SIDE" != "comparison" ] && [ "$BENCH_RUN_SIDE" != "feature" ] && [ "$BENCH_RUN_SIDE" != "baseline" ]; then
+            echo "::error::run-side must be one of: comparison, feature, baseline"
             exit 1
+          fi
+          if [ "$BENCH_RUN_SIDE" = "baseline" ] && [ "$BENCH_CLICKHOUSE_RUN" = "feature-1" ]; then
+            BENCH_CLICKHOUSE_RUN="baseline-1"
           fi
           if ! [[ "$BENCH_TOKEN_COUNT" =~ ^[1-9][0-9]*$ ]]; then
             echo "::error::token-count must be a positive integer"
@@ -881,24 +897,31 @@ jobs:
             --gas-limit "$BENCH_GAS_LIMIT"
             --baseline "$BASELINE_REF"
             --feature "$FEATURE_REF"
-            --baseline-name "${{ steps.refs.outputs.baseline-name }}"
-            --feature-name "${{ steps.refs.outputs.feature-name }}"
+            --baseline-name "$BASELINE_NAME"
+            --feature-name "$FEATURE_NAME"
             --tune
             --no-default-features
             --features "$BENCH_FEATURES"
             --skip-summary
           )
+          [ -n "$BENCH_TXGEN_SPEC_PATH" ] && cmd+=(--preset-path "$BENCH_TXGEN_SPEC_PATH")
           [ "$BENCH_FORCE_BLOAT" = "true" ] && cmd+=(--force-bloat)
           [ "$BENCH_NO_CACHE" = "true" ] && cmd+=(--no-cache)
           [ "$BENCH_SAMPLY" = "true" ] && cmd+=(--samply)
           [ "$BENCH_TRACY" != "off" ] && cmd+=(--tracy "$BENCH_TRACY" --tracy-seconds "$BENCH_TRACY_SECONDS" --tracy-offset "$BENCH_TRACY_OFFSET")
+          effective_baseline_args="$BENCH_BASELINE_ARGS"
+          effective_feature_args="$BENCH_FEATURE_ARGS"
+          if [ "$BENCH_SKIP_STATE_ROOT" = "true" ]; then
+            effective_baseline_args="${effective_baseline_args:+$effective_baseline_args }--debug.skip-state-root"
+            effective_feature_args="${effective_feature_args:+$effective_feature_args }--debug.skip-state-root"
+          fi
           [ -n "$BENCH_GENERAL_GAS_LIMIT" ] && cmd+=(--general-gas-limit "$BENCH_GENERAL_GAS_LIMIT")
           [ -n "$BENCH_BASELINE_HARDFORK" ] && cmd+=(--baseline-hardfork="$BENCH_BASELINE_HARDFORK")
           [ -n "$BENCH_FEATURE_HARDFORK" ] && cmd+=(--feature-hardfork="$BENCH_FEATURE_HARDFORK")
           [ -n "$BENCH_BASELINE_FEATURES" ] && cmd+=(--baseline-features="$BENCH_BASELINE_FEATURES")
           [ -n "$BENCH_FEATURE_FEATURES" ] && cmd+=(--feature-features="$BENCH_FEATURE_FEATURES")
-          [ -n "$BENCH_BASELINE_ARGS" ] && cmd+=(--baseline-args="$BENCH_BASELINE_ARGS")
-          [ -n "$BENCH_FEATURE_ARGS" ] && cmd+=(--feature-args="$BENCH_FEATURE_ARGS")
+          [ -n "$effective_baseline_args" ] && cmd+=(--baseline-args="$effective_baseline_args")
+          [ -n "$effective_feature_args" ] && cmd+=(--feature-args="$effective_feature_args")
           [ -n "$BENCH_BENCH_ARGS" ] && cmd+=(--bench-args="$BENCH_BENCH_ARGS")
           [ -n "$BENCH_BENCH_ENV" ] && cmd+=(--bench-env="$BENCH_BENCH_ENV")
           [ -n "$BENCH_BASELINE_ENV" ] && cmd+=(--baseline-env="$BENCH_BASELINE_ENV")
@@ -950,8 +973,8 @@ jobs:
             tps="$BENCH_TPS"
             accounts="$BENCH_ACCOUNTS"
             max-concurrent-requests="$BENCH_MAX_CONCURRENT_REQUESTS"
-            baseline="${{ steps.refs.outputs.baseline-name }}"
-            feature="${{ steps.refs.outputs.feature-name }}"
+            baseline="$BASELINE_NAME"
+            feature="$FEATURE_NAME"
             baseline-hardfork="$BENCH_BASELINE_HARDFORK"
             feature-hardfork="$BENCH_FEATURE_HARDFORK"
             gas-limit="$BENCH_GAS_LIMIT"
@@ -966,6 +989,7 @@ jobs:
           [ -n "$BENCH_TXGEN_REF" ] && derek_cmd+=(txgen-ref="$BENCH_TXGEN_REF")
           [ "$BENCH_SAMPLY" = "true" ] && derek_cmd+=(samply)
           [ "$BENCH_TRACY" != "off" ] && derek_cmd+=(tracy="$BENCH_TRACY" tracy-seconds="$BENCH_TRACY_SECONDS" tracy-offset="$BENCH_TRACY_OFFSET")
+          [ "$BENCH_SKIP_STATE_ROOT" = "true" ] && derek_cmd+=(skip-state-root)
           [ -n "$BENCH_BASELINE_FEATURES" ] && derek_cmd+=(baseline-features="$BENCH_BASELINE_FEATURES")
           [ -n "$BENCH_FEATURE_FEATURES" ] && derek_cmd+=(feature-features="$BENCH_FEATURE_FEATURES")
           [ -n "$BENCH_BASELINE_ARGS" ] && derek_cmd+=(baseline-args="$BENCH_BASELINE_ARGS")

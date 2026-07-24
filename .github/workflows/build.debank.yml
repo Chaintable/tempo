@@ -51,6 +51,9 @@ jobs:
           push: true
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE }}:${{ matrix.arch }}-${{ env.REVISION }}
           provenance: false
+          build-args: |
+            VERGEN_GIT_SHA=${{ github.event.pull_request.head.sha }}
+            VERGEN_GIT_SHA_SHORT=${{ github.event.pull_request.head.sha }}
 
 
   merge-docker-manifest:

@@ -1,4 +1,4 @@
-use crate::{TempoBlockExecutionCtx, evm::TempoEvm};
+use crate::{StorageActionReplayState, TempoBlockExecutionCtx, evm::TempoEvm};
 use alloy_consensus::{Transaction, transaction::TxHashRef};
 use alloy_evm::{
     Database, Evm, RecoveredTx,
@@ -11,9 +11,10 @@ use alloy_evm::{
         receipt_builder::{ReceiptBuilder, ReceiptBuilderCtx},
     },
 };
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_rlp::Decodable;
-use commonware_codec::DecodeExt;
+use alloy_sol_types::SolCall;
+use commonware_codec::{DecodeExt, ReadExt};
 use commonware_cryptography::{
     Verifier,
     ed25519::{PublicKey, Signature},
@@ -21,14 +22,15 @@ use commonware_cryptography::{
 use reth_evm::block::StateDB;
 use reth_revm::{
     Inspector,
-    context::result::ResultAndState,
+    context::result::{ExecutionResult, ResultAndState},
     state::{Account, Bytecode, EvmState},
 };
 use std::collections::{HashMap, HashSet};
 use tempo_chainspec::{TempoChainSpec, hardfork::TempoHardforks};
 use tempo_contracts::precompiles::{
-    ADDRESS_REGISTRY_ADDRESS, RECEIVE_POLICY_GUARD_ADDRESS, SIGNATURE_VERIFIER_ADDRESS,
-    STORAGE_CREDITS_ADDRESS, TIP20_CHANNEL_RESERVE_ADDRESS, VALIDATOR_CONFIG_V2_ADDRESS,
+    ADDRESS_REGISTRY_ADDRESS, CURRENT_COMMITTEE_ADDRESS, ICurrentCommittee,
+    RECEIVE_POLICY_GUARD_ADDRESS, SIGNATURE_VERIFIER_ADDRESS, STORAGE_CREDITS_ADDRESS,
+    TIP20_CHANNEL_RESERVE_ADDRESS, VALIDATOR_CONFIG_V2_ADDRESS,
 };
 use tempo_primitives::{
     SubBlock, SubBlockMetadata, TempoReceipt, TempoTxEnvelope, TempoTxType,
@@ -106,6 +108,30 @@ pub struct TempoTxResult {
 }
 
 impl TempoTxResult {
+    /// Creates a new [`TempoTxResult`] from a precomputed result and state.
+    pub(crate) fn new_precomputed(
+        tx: &TempoTxEnvelope,
+        result: ExecutionResult<TempoHaltReason>,
+        state: EvmState,
+        next_section: BlockSection,
+        is_payment: bool,
+        block_gas_used: u64,
+        validator_fee: U256,
+    ) -> Self {
+        Self {
+            inner: EthTxResult {
+                result: ResultAndState::new(result, state),
+                blob_gas_used: 0,
+                tx_type: tx.tx_type(),
+            },
+            next_section,
+            is_payment,
+            tx: matches!(next_section, BlockSection::SubBlock { .. }).then(|| tx.clone()),
+            block_gas_used,
+            validator_fee,
+        }
+    }
+
     /// Returns the block gas consumed by this transaction.
     pub fn block_gas_used(&self) -> u64 {
         self.block_gas_used
@@ -146,9 +172,12 @@ pub struct TempoBlockExecutor<'a, DB: Database, I> {
     section: BlockSection,
     seen_subblocks: Vec<(PartialValidatorKey, Vec<TempoTxEnvelope>)>,
     validator_set: Option<Vec<B256>>,
-    shared_gas_limit: u64,
     subblock_fee_recipients: HashMap<PartialValidatorKey, Address>,
+    extra_data: Bytes,
 
+    pub(crate) replay_state: StorageActionReplayState,
+
+    shared_gas_limit: u64,
     non_shared_gas_left: u64,
     non_payment_gas_left: u64,
     incentive_gas_used: u64,
@@ -170,6 +199,7 @@ where
             non_payment_gas_left: ctx.general_gas_limit,
             non_shared_gas_left: evm.block().gas_limit.saturating_sub(ctx.shared_gas_limit),
             shared_gas_limit: ctx.shared_gas_limit,
+            extra_data: ctx.inner.extra_data.clone(),
             inner: EthBlockExecutor::new(
                 evm,
                 ctx.inner,
@@ -179,6 +209,7 @@ where
             section: BlockSection::StartOfBlock,
             seen_subblocks: Vec::new(),
             subblock_fee_recipients: ctx.subblock_fee_recipients,
+            replay_state: StorageActionReplayState::default(),
         }
     }
 
@@ -209,13 +240,58 @@ where
         Ok(())
     }
 
+    fn apply_current_committee_system_call(&mut self) -> Result<(), BlockExecutionError> {
+        if !self.evm().cfg.spec.is_t8() {
+            return Ok(());
+        }
+
+        let epoch_length = self.evm().block().epoch_length.get();
+        let block_number = self.evm().block().number.saturating_to::<u64>();
+        if !block_number.saturating_add(1).is_multiple_of(epoch_length) {
+            return Ok(());
+        }
+
+        let outcome =
+            tempo_dkg_onchain_artifacts::OnchainDkgOutcome::read(&mut self.extra_data.as_ref())
+                .map_err(|err| {
+                    BlockValidationError::msg(format!(
+                        "failed decoding boundary block extra data as DKG outcome: {err}"
+                    ))
+                })?;
+        let epoch = outcome.epoch.get();
+        let public_keys = outcome
+            .players()
+            .iter()
+            .map(|key| B256::from_slice(key.as_ref()))
+            .collect();
+
+        let calldata = ICurrentCommittee::setCommitteeMembersCall {
+            epoch,
+            publicKeys: public_keys,
+        }
+        .abi_encode()
+        .into();
+
+        let result = self
+            .evm_mut()
+            .transact_system_call(Address::ZERO, CURRENT_COMMITTEE_ADDRESS, calldata)
+            .map_err(BlockExecutionError::other)?;
+
+        if !result.result.is_success() {
+            return Err(BlockValidationError::msg("current committee system call failed").into());
+        }
+
+        self.evm_mut().db_mut().commit(result.state);
+        Ok(())
+    }
+
     /// Validates a system transaction.
     pub(crate) fn validate_system_tx(
         &self,
         tx: &TempoTxEnvelope,
     ) -> Result<BlockSection, BlockValidationError> {
         let block = self.evm().block();
-        let block_number = block.number.to_be_bytes_vec();
+        let block_number = block.number.to_be_bytes::<32>();
         let to = tx.to().unwrap_or_default();
 
         // Handle end-of-block system transactions (subblocks signatures only)
@@ -237,15 +313,20 @@ where
                 return Err(BlockValidationError::msg("subblocks are disabled in T4+"));
             }
 
-            if tx.input().len() < U256::BYTES
-                || tx.input()[tx.input().len() - U256::BYTES..] != block_number
-            {
+            let Some((metadata_input, input_block_number)) = tx.input().split_last_chunk::<32>()
+            else {
+                return Err(BlockValidationError::msg(
+                    "invalid subblocks metadata system transaction",
+                ));
+            };
+
+            if input_block_number != &block_number {
                 return Err(BlockValidationError::msg(
                     "invalid subblocks metadata system transaction",
                 ));
             }
 
-            let mut buf = &tx.input()[..tx.input().len() - U256::BYTES];
+            let mut buf = metadata_input;
             let Ok(metadata) = Vec::<SubBlockMetadata>::decode(&mut buf) else {
                 return Err(BlockValidationError::msg(
                     "invalid subblocks metadata system transaction",
@@ -497,6 +578,9 @@ where
         if self.inner.spec.is_t7_active_at_timestamp(timestamp) {
             self.deploy_precompile_at_boundary(STORAGE_CREDITS_ADDRESS)?;
         }
+        if self.inner.spec.is_t8_active_at_timestamp(timestamp) {
+            self.deploy_precompile_at_boundary(CURRENT_COMMITTEE_ADDRESS)?;
+        }
 
         Ok(())
     }
@@ -609,11 +693,13 @@ where
             }
         }
 
+        self.replay_state.commit_tx_changes();
+
         gas_output
     }
 
     fn finish(
-        self,
+        mut self,
     ) -> Result<(Self::Evm, BlockExecutionResult<Self::Receipt>), BlockExecutionError> {
         let seen_subblock_signatures = match self.section {
             BlockSection::System {
@@ -626,6 +712,8 @@ where
         if !seen_subblock_signatures && self.evm().cfg.spec.is_t4() {
             self.validate_shared_gas(&[])?;
         }
+
+        self.apply_current_committee_system_call()?;
 
         let amsterdam_eip8037_enabled = self.evm().cfg.enable_amsterdam_eip8037;
 
@@ -696,16 +784,27 @@ mod tests {
     use alloy_evm::{block::BlockExecutor, eth::receipt_builder::ReceiptBuilder};
     use alloy_primitives::{Bytes, Log, Signature, TxKind, bytes::BytesMut};
     use alloy_rlp::Encodable;
-    use commonware_cryptography::{Signer, ed25519::PrivateKey};
+    use commonware_codec::Encode as _;
+    use commonware_consensus::types::Epoch;
+    use commonware_cryptography::{Signer, bls12381::dkg, ed25519::PrivateKey};
+    use commonware_math::algebra::Random as _;
+    use commonware_utils::{N3f1, TryFromIterator as _, ordered};
+    use rand_08::SeedableRng as _;
     use reth_chainspec::EthChainSpec;
     use reth_revm::{State, state::AccountInfo};
     use revm::{
         context::result::{ExecutionResult, ResultGas},
         database::EmptyDB,
     };
-    use std::sync::{Arc, Mutex};
-    use tempo_chainspec::spec::DEV;
-    use tempo_contracts::precompiles::PATH_USD_ADDRESS;
+    use std::{
+        iter::repeat_with,
+        sync::{Arc, Mutex},
+    };
+    use tempo_chainspec::{TempoHardfork, spec::DEV};
+    use tempo_contracts::precompiles::{
+        CURRENT_COMMITTEE_ADDRESS, ICurrentCommittee, PATH_USD_ADDRESS,
+    };
+    use tempo_dkg_onchain_artifacts::OnchainDkgOutcome;
     use tempo_primitives::{
         SubBlockMetadata, TempoSignature, TempoTransaction, TempoTxType,
         subblock::{SubBlockVersion, TEMPO_SUBBLOCK_NONCE_KEY_PREFIX},
@@ -737,6 +836,60 @@ mod tests {
             input: Bytes::new(),
         };
         TempoTxEnvelope::Legacy(Signed::new_unhashed(tx, Signature::test_signature()))
+    }
+
+    fn create_dkg_outcome(epoch: u64, players: usize) -> OnchainDkgOutcome {
+        let mut rng = rand_08::rngs::StdRng::seed_from_u64(epoch);
+        let mut player_keys = repeat_with(|| PrivateKey::random(&mut rng))
+            .take(players)
+            .collect::<Vec<_>>();
+        player_keys.sort_by_key(|key| key.public_key());
+
+        let player_set =
+            ordered::Set::try_from_iter(player_keys.iter().map(|key| key.public_key())).unwrap();
+        let (output, shares) =
+            dkg::deal::<_, _, N3f1>(&mut rng, Default::default(), player_set).unwrap();
+
+        OnchainDkgOutcome {
+            epoch: Epoch::new(epoch),
+            output,
+            next_players: shares.keys().clone(),
+            is_next_full_dkg: false,
+        }
+    }
+
+    fn read_current_committee<DB, I>(
+        executor: &mut TempoBlockExecutor<'_, DB, I>,
+    ) -> ICurrentCommittee::getCommitteeMembersReturn
+    where
+        DB: StateDB,
+        I: Inspector<TempoContext<DB>>,
+    {
+        let result = executor
+            .evm_mut()
+            .transact_system_call(
+                Address::ZERO,
+                CURRENT_COMMITTEE_ADDRESS,
+                ICurrentCommittee::getCommitteeMembersCall {}
+                    .abi_encode()
+                    .into(),
+            )
+            .unwrap();
+        assert!(
+            result.result.is_success(),
+            "getCommitteeMembers failed: {:?}",
+            result.result
+        );
+
+        let output = match result.result {
+            ExecutionResult::Success {
+                output: revm::context::result::Output::Call(output),
+                ..
+            } => output,
+            result => panic!("unexpected getCommitteeMembers result: {result:?}"),
+        };
+
+        ICurrentCommittee::getCommitteeMembersCall::abi_decode_returns(&output).unwrap()
     }
 
     #[test]
@@ -1327,6 +1480,74 @@ mod tests {
 
         assert_eq!(gas_output.tx_gas_used(), 21000);
         assert_eq!(executor.section(), BlockSection::NonShared);
+    }
+
+    #[test]
+    fn test_current_committee_system_call_writes_boundary_outcome() {
+        let chainspec = test_chainspec();
+        let mut db = State::builder().with_bundle_update().build();
+        let outcome = create_dkg_outcome(42, 3);
+        let expected_public_keys = outcome
+            .players()
+            .iter()
+            .map(|key| B256::from_slice(key.as_ref()))
+            .collect::<Vec<_>>();
+
+        let mut executor = TestExecutorBuilder::default()
+            .with_block_number(4)
+            .with_epoch_length(5)
+            .with_extra_data(outcome.encode().into())
+            .with_spec(TempoHardfork::T8)
+            .build(&mut db, &chainspec);
+        executor
+            .deploy_precompile_at_boundary(CURRENT_COMMITTEE_ADDRESS)
+            .unwrap();
+
+        executor.apply_current_committee_system_call().unwrap();
+
+        let committee = read_current_committee(&mut executor);
+        assert_eq!(committee.epoch, outcome.epoch.get());
+        assert_eq!(committee.publicKeys, expected_public_keys);
+    }
+
+    #[test]
+    fn test_current_committee_system_call_skips_non_boundary_block() {
+        let chainspec = test_chainspec();
+        let mut db = State::builder().with_bundle_update().build();
+        let mut executor = TestExecutorBuilder::default()
+            .with_block_number(3)
+            .with_epoch_length(5)
+            .with_extra_data(Bytes::from_static(&[0xff]))
+            .with_spec(TempoHardfork::T8)
+            .build(&mut db, &chainspec);
+        executor
+            .deploy_precompile_at_boundary(CURRENT_COMMITTEE_ADDRESS)
+            .unwrap();
+
+        executor.apply_current_committee_system_call().unwrap();
+
+        let committee = read_current_committee(&mut executor);
+        assert_eq!(committee.epoch, 0);
+        assert!(committee.publicKeys.is_empty());
+    }
+
+    #[test]
+    fn test_current_committee_system_call_rejects_invalid_boundary_extra_data() {
+        let chainspec = test_chainspec();
+        let mut db = State::builder().with_bundle_update().build();
+        let mut executor = TestExecutorBuilder::default()
+            .with_block_number(4)
+            .with_epoch_length(5)
+            .with_extra_data(Bytes::from_static(&[0xff]))
+            .with_spec(TempoHardfork::T8)
+            .build(&mut db, &chainspec);
+
+        let err = executor.apply_current_committee_system_call().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("failed decoding boundary block extra data as DKG outcome"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

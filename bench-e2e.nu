@@ -16,11 +16,12 @@ const E2E_A_CPUS = "0-7,16-23"
 const E2E_B_CPUS = "8-15,24-31"
 const E2E_A_MEMORY = "60G"
 const E2E_B_MEMORY = "60G"
-const E2E_GAS_LIMIT = "5000000000"
+const E2E_GAS_LIMIT = "1000000000000"
 const E2E_RUNNER_METRICS_URL = "http://127.0.0.1:9100/metrics"
 const E2E_BLOAT_TMP_DIR = "/reth-bench-a/.bench-tmp/e2e-local-init"
 const TRACY_SAMPLING_HZ = 18999
 const E2E_BLOAT_FREE_MARGIN_MIB = 51200
+const E2E_BLOAT_IMPORT_WORKING_SET_MULTIPLIER = 7
 const E2E_DEFAULT_BLOAT = 100
 const E2E_LOCAL_RETH_ARGS = [
     "--ipcdisable"
@@ -219,13 +220,46 @@ def ensure-bloat-space [bloat: int] {
     if $bloat <= 0 {
         return
     }
-    let required_mib = $bloat + $E2E_BLOAT_FREE_MARGIN_MIB
-    for mount in [$E2E_A_MOUNT $E2E_B_MOUNT] {
-        let available_mib = (df-available-mib $mount)
-        if $available_mib < $required_mib {
-            print $"Error: ($mount) has ($available_mib) MiB free, needs at least ($required_mib) MiB for ($bloat) MiB bloat plus margin"
-            exit 1
+
+    let import_working_set_mib = $bloat * $E2E_BLOAT_IMPORT_WORKING_SET_MULTIPLIER
+    let a_required_mib = $bloat + $import_working_set_mib + $E2E_BLOAT_FREE_MARGIN_MIB
+    let b_required_mib = $import_working_set_mib + $E2E_BLOAT_FREE_MARGIN_MIB
+    let requirements = [
+        {
+            mount: $E2E_A_MOUNT
+            required_mib: $a_required_mib
+            components: $"dump=($bloat) MiB, import-working-set=($import_working_set_mib) MiB, margin=($E2E_BLOAT_FREE_MARGIN_MIB) MiB"
         }
+        {
+            mount: $E2E_B_MOUNT
+            required_mib: $b_required_mib
+            components: $"import-working-set=($import_working_set_mib) MiB, margin=($E2E_BLOAT_FREE_MARGIN_MIB) MiB"
+        }
+    ]
+
+    print "Checking e2e bloat rebuild free space..."
+    print $"  Bloat dump: ($bloat) MiB on ($E2E_A_MOUNT)"
+    print $"  Import working set: ($import_working_set_mib) MiB per side; multiplier=($E2E_BLOAT_IMPORT_WORKING_SET_MULTIPLIER)x bloat for DB, ETL, static file, and trie writes"
+    print $"  Free-space margin: ($E2E_BLOAT_FREE_MARGIN_MIB) MiB per side"
+
+    mut failed = false
+    for requirement in $requirements {
+        let available_mib = (df-available-mib $requirement.mount)
+        print $"  ($requirement.mount): available=($available_mib) MiB required=($requirement.required_mib) MiB \(($requirement.components)\)"
+        if $available_mib < $requirement.required_mib {
+            $failed = true
+        }
+    }
+
+    if $failed {
+        print "Error: insufficient free space for e2e bloat snapshot rebuild"
+        for requirement in $requirements {
+            let available_mib = (df-available-mib $requirement.mount)
+            if $available_mib < $requirement.required_mib {
+                print $"  ($requirement.mount) needs at least ($requirement.required_mib) MiB, has ($available_mib) MiB"
+            }
+        }
+        exit 1
     }
 }
 
@@ -1094,8 +1128,7 @@ def run-local-e2e-phase [run: record, ctx: record] {
         $tracy_capture_started = true
     }
 
-    let tps_k = ($ctx.tps // 1000)
-    let scenario = $"($ctx.preset)-($tps_k)k"
+    let scenario = $ctx.preset
     let phase_clickhouse_url = if $ctx.clickhouse_url != "" and ($ctx.clickhouse_run == "" or $ctx.clickhouse_run == $phase) {
         $ctx.clickhouse_url
     } else {
@@ -1103,6 +1136,7 @@ def run-local-e2e-phase [run: record, ctx: record] {
     }
     let metrics_urls = ["a:http://127.0.0.1:9001/metrics" "b:http://127.0.0.1:9101/metrics"]
         | append (if $ctx.runner_metrics_url != "" { [$"runner:($ctx.runner_metrics_url)"] } else { [] })
+    let submit_rpc_url = [$a_rpc $b_rpc] | str join ","
 
     if $phase_exit == 0 {
         let phase_started_ms = ((date now | into int) / 1_000_000 | into int)
@@ -1113,7 +1147,7 @@ def run-local-e2e-phase [run: record, ctx: record] {
                 --txgen-bench-bin $ctx.txgen.txgen_bench_bin
                 --preset-path $ctx.preset_path
                 --generate-rpc-url $a_rpc
-                --submit-rpc-url $a_rpc
+                --submit-rpc-url $submit_rpc_url
                 --metrics-url $metrics_urls
                 --report-path $"($ctx.results_dir)/report-($phase).json"
                 --tps $ctx.tps
@@ -1210,6 +1244,9 @@ def e2e-run-sides [run_pairs: int, run_side: string] {
     if $run_side == "feature" {
         return (0..<$run_pairs | each { "feature" })
     }
+    if $run_side == "baseline" {
+        return (0..<$run_pairs | each { "baseline" })
+    }
 
     mut sides = []
     if ($run_pairs mod 2) == 0 {
@@ -1303,11 +1340,20 @@ def "main summarize" [
     e2e-generate-summary $results_dir
 }
 
+def "main render-txgen-spec" [
+    --preset: string = ""                              # Txgen preset name or scenario expression
+    --out-dir: string = ""                             # Directory for rendered scenario specs
+] {
+    let spec = (txgen-resolve-bench-spec $preset $out_dir)
+    print $spec.spec_path
+}
+
 # Run the e2e sequence on one runner.
 def "main e2e" [
     --baseline: string                                  # Baseline git SHA/ref
     --feature: string                                   # Feature git SHA/ref
     --preset: string = ""                               # Txgen preset name
+    --preset-path: string = ""                          # Pre-rendered txgen preset path
     --tps: int = 50000                                  # Target TPS
     --duration: int = 90                                # Duration in seconds
     --summary-warmup-blocks: int = 5                    # Initial blocks per run excluded from summary metrics
@@ -1316,7 +1362,7 @@ def "main e2e" [
     --bloat: int = $E2E_DEFAULT_BLOAT                   # State bloat snapshot size in GiB: 0, 1, 10, or 100
     --token-count: int = 4                         # Number of TIP20 tokens to use in txgen presets
     --gas-limit: string = $E2E_GAS_LIMIT                # Builder gas limit
-    --general-gas-limit: string = ""                    # General (non-payment) gas limit override
+    --general-gas-limit: string = $E2E_GAS_LIMIT        # General (non-payment) gas limit override
     --force-bloat                                      # Regenerate and promote both local e2e snapshots
     --init-only                                         # Refresh snapshots and exit without running benchmark phases
     --profile: string = $DEFAULT_PROFILE                # Cargo build profile
@@ -1336,7 +1382,7 @@ def "main e2e" [
     --clickhouse-run: string = "feature-1"              # Run label allowed to use the ClickHouse reporter; empty = every run
     --runner-metrics-url: string = $E2E_RUNNER_METRICS_URL # Runner node-exporter metrics URL (empty disables runner metrics)
     --run-pairs: int = 3                                # Number of baseline/feature run pairs
-    --run-side: string = "comparison"                   # Phases to run: comparison or feature
+    --run-side: string = "comparison"                   # Phases to run: comparison, feature, or baseline
     --run-type: string = ""                             # Run type label (dispatch, nightly, release)
     --baseline-args: string = ""                        # Additional node args for baseline phases
     --feature-args: string = ""                         # Additional node args for feature phases
@@ -1355,8 +1401,27 @@ def "main e2e" [
     --valscope-dir: string = "../valscope"               # Path to the ValScope checkout
     --skip-summary                                       # Leave summary generation to a later workflow step
 ] {
-    let preset_path = (txgen-preset-path $preset)
+    let preset_spec = if $preset_path == "" {
+        txgen-resolve-bench-spec $preset
+    } else {
+        {
+            kind: pre_rendered
+            scenario_id: $preset
+            spec_path: ($preset_path | path expand)
+            rendered: true
+        }
+    }
+    let preset_path = $preset_spec.spec_path
+    if not ($preset_path | path exists) {
+        print $"Error: txgen preset file not found: ($preset_path)"
+        exit 1
+    }
     txgen-validate-bench-args $bench_args
+    let general_gas_limit = if $general_gas_limit == "" and (txgen-spec-has-keychain-setup $preset_path) {
+        $gas_limit
+    } else {
+        $general_gas_limit
+    }
     if $tracy not-in ["off" "tracy"] {
         print $"Error: --tracy must be one of: off, tracy \(got '($tracy)'\)"
         exit 1
@@ -1365,8 +1430,8 @@ def "main e2e" [
         print "Error: --run-pairs must be a positive integer"
         exit 1
     }
-    if $run_side not-in ["comparison" "feature"] {
-        print $"Error: --run-side must be one of: comparison, feature \(got '($run_side)'\)"
+    if $run_side not-in ["comparison" "feature" "baseline"] {
+        print $"Error: --run-side must be one of: comparison, feature, baseline \(got '($run_side)'\)"
         exit 1
     }
     if $summary_warmup_blocks < 0 {
@@ -1484,6 +1549,9 @@ def "main e2e" [
             exit 1
         }
         if $bloat_mib > 0 {
+            print "Cleaning restored e2e datadirs before bloat snapshot rebuild..."
+            bench-clean-datadir $a_db
+            bench-clean-datadir $b_db
             ensure-bloat-space $bloat_mib
             print $"Generating local e2e state bloat \(($bloat_mib) MiB\)..."
             let token_args = ($TIP20_TOKEN_IDS | each { |id| ["--token" $"($id)"] } | flatten)
@@ -1541,14 +1609,22 @@ def "main e2e" [
     let results_dir = $"($BENCH_RESULTS_DIR)/($timestamp)"
     mkdir $results_dir
     print $"BENCH_RESULTS_DIR=($results_dir)"
+    cp $preset_path $"($results_dir)/txgen-spec.yml"
 
     git worktree prune
     mkdir $BENCH_WORKTREES_DIR
     let baseline_wt = $"($BENCH_WORKTREES_DIR)/e2e-local-baseline"
     let feature_wt = $"($BENCH_WORKTREES_DIR)/e2e-local-feature"
     let regenesis_needed = $hardfork_mode or $gas_limit != "" or $general_gas_limit != ""
-    let needs_baseline = $run_side == "comparison"
-    let worktrees = if $needs_baseline { [$baseline_wt $feature_wt] } else { [$feature_wt] }
+    let needs_baseline = $run_side in ["comparison" "baseline"]
+    let needs_feature = $run_side in ["comparison" "feature"]
+    mut worktrees = []
+    if $needs_baseline {
+        $worktrees = ($worktrees | append $baseline_wt)
+    }
+    if $needs_feature {
+        $worktrees = ($worktrees | append $feature_wt)
+    }
     for wt in $worktrees {
         if ($wt | path exists) {
             print $"Removing stale local e2e worktree: ($wt)"
@@ -1558,7 +1634,9 @@ def "main e2e" [
     if $needs_baseline {
         git worktree add $baseline_wt $baseline
     }
-    git worktree add $feature_wt $feature
+    if $needs_feature {
+        git worktree add $feature_wt $feature
+    }
 
     let global_build_features = (merge-e2e-features $DEFAULT_FEATURES $features)
     let baseline_build_features = if $baseline_features != "" { merge-e2e-features $global_build_features $baseline_features } else { $global_build_features }
@@ -1572,7 +1650,9 @@ def "main e2e" [
     if $needs_baseline {
         $builds = ($builds | append { wt: $baseline_wt, ref_name: $baseline, sha: $baseline, label: "baseline", features: $baseline_tbc.features, extra_rustflags: $baseline_tbc.extra_rustflags, bench_features: $baseline_build_features })
     }
-    $builds = ($builds | append { wt: $feature_wt, ref_name: $feature, sha: $feature, label: "feature", features: $feature_tbc.features, extra_rustflags: $feature_tbc.extra_rustflags, bench_features: $feature_build_features })
+    if $needs_feature {
+        $builds = ($builds | append { wt: $feature_wt, ref_name: $feature, sha: $feature, label: "feature", features: $feature_tbc.features, extra_rustflags: $feature_tbc.extra_rustflags, bench_features: $feature_build_features })
+    }
     $builds | par-each { |b|
         if $effective_no_cache {
             build-in-worktree --no-cache --no-default-features=$no_default_features --extra-rustflags $b.extra_rustflags --bench-features $b.bench_features $b.wt $b.ref_name $profile $b.features $b.sha
@@ -1581,10 +1661,12 @@ def "main e2e" [
         }
     } | ignore
     let baseline_tempo = if $needs_baseline { worktree-bin $baseline_wt $profile "tempo" } else { "" }
-    let feature_tempo = (worktree-bin $feature_wt $profile "tempo")
-    let regenesis_tempo = if $regenesis_needed { $feature_tempo } else { "" }
+    let feature_tempo = if $needs_feature { worktree-bin $feature_wt $profile "tempo" } else { "" }
+    let regenesis_tempo = if $regenesis_needed {
+        if $needs_feature { $feature_tempo } else { $baseline_tempo }
+    } else { "" }
     let baseline_arg_filter = if $needs_baseline { supported-node-arg-filter $baseline_tempo $E2E_LOCAL_RETH_ARGS } else { { supported: [], removed: [] } }
-    let feature_arg_filter = (supported-node-arg-filter $feature_tempo $E2E_LOCAL_RETH_ARGS)
+    let feature_arg_filter = if $needs_feature { supported-node-arg-filter $feature_tempo $E2E_LOCAL_RETH_ARGS } else { { supported: [], removed: [] } }
     let removed_arg_config = $"(format-removed-node-arg-config 'baseline' $baseline_arg_filter.removed)(format-removed-node-arg-config 'feature' $feature_arg_filter.removed)"
     if $removed_arg_config != "" {
         let current_config = ($env | get -o BENCH_CONFIG | default "")
@@ -1745,7 +1827,9 @@ def "main e2e" [
     if $needs_baseline {
         try { git worktree remove --force $baseline_wt } catch { }
     }
-    try { git worktree remove --force $feature_wt } catch { }
+    if $needs_feature {
+        try { git worktree remove --force $feature_wt } catch { }
+    }
     cleanup-local-e2e-processes
     bench-restore-at $E2E_A_STATE_PATH $E2E_A_MOUNT $a_db
     bench-restore-at $E2E_B_STATE_PATH $E2E_B_MOUNT $b_db
