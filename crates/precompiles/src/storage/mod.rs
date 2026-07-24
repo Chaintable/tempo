@@ -7,6 +7,7 @@ pub mod actions;
 pub use actions::{StorageAction, StorageActions};
 
 pub mod evm;
+pub use evm::SstoreTransitionFlags;
 pub mod hashmap;
 
 pub mod thread_local;
@@ -121,6 +122,11 @@ pub trait PrecompileStorageProvider {
 
     /// Returns the currently active hardfork.
     fn spec(&self) -> TempoHardfork;
+
+    /// Returns the shared storage-actions recorder for this provider.
+    fn storage_actions(&self) -> StorageActions {
+        StorageActions::disabled()
+    }
 
     /// Mirrors `CfgEnv::enable_amsterdam_eip8037`. Used by precompiles to gate the TIP-1016
     /// regular/state gas split independently of the active hardfork.

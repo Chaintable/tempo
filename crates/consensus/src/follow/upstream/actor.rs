@@ -1,27 +1,38 @@
 use std::{sync::Arc, time::Duration};
 
+use alloy_rpc_types_eth::{Block as RpcBlock, Transaction};
 use commonware_consensus::{Reporter, types::Height};
 use commonware_runtime::{Clock, ContextCell, Metrics, Spawner, spawn_cell};
-use eyre::{Report, WrapErr as _};
+use eyre::{Report, WrapErr as _, ensure};
 use futures::{
     FutureExt as _, StreamExt as _,
     future::{BoxFuture, Either},
     stream::{self, Fuse, FusedStream},
 };
 use jsonrpsee::{
-    core::{client, client::Subscription},
-    ws_client::{WsClient, WsClientBuilder},
+    core::{
+        client,
+        client::{ClientT as _, Subscription},
+    },
+    rpc_params,
+    ws_client::{PingConfig, WsClient, WsClientBuilder},
 };
 use rand_08::Rng as _;
+use reth_primitives_traits::{SealedBlock, SealedOrRecoveredBlock};
 use tempo_node::rpc::consensus::{CertifiedBlock, Event, Query, TempoConsensusApiClient};
+use tempo_primitives::{TempoHeader, TempoTxEnvelope};
 use tempo_telemetry_util::display_duration;
 use tokio::{
     select,
     sync::{mpsc, oneshot},
 };
 use tracing::{debug, debug_span, instrument, warn, warn_span};
+use url::Url;
 
-use crate::utils::OptionFuture;
+use crate::{
+    consensus::{Block, Digest},
+    utils::OptionFuture,
+};
 
 pub(super) type EventStream =
     Either<stream::Empty<Result<Event, serde_json::Error>>, Fuse<Subscription<Event>>>;
@@ -29,6 +40,16 @@ pub(super) type EventStream =
 const RECONNECT_BACKOFF_FACTOR: u64 = 2;
 const RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(20);
 const RECONNECT_JITTER: Duration = Duration::from_secs(1);
+
+/// How often websocket pings are sent to keep the connection to the upstream
+/// node alive (and to detect dead connections, triggering a reconnect).
+const PING_INTERVAL: Duration = Duration::from_secs(5);
+/// How long the connection may stay inactive (no pongs or other messages)
+/// before it is considered dead and closed.
+const PING_INACTIVE_LIMIT: Duration = Duration::from_secs(10);
+/// How many times the connection may exceed the inactivity limit before it is
+/// closed.
+const PING_MAX_FAILURES: usize = 1;
 
 /// Manages the connection to the upstream node.
 ///
@@ -38,13 +59,13 @@ pub(crate) struct Actor<TContext> {
     pub(super) context: ContextCell<TContext>,
     pub(super) connection: Option<Arc<WsClient>>,
     pub(super) mailbox: mpsc::UnboundedReceiver<super::ingress::Message>,
-    pub(super) url: &'static str,
+    pub(super) url: &'static Url,
     pub(super) pending_connect: OptionFuture<BoxFuture<'static, (u64, eyre::Result<WsClient>)>>,
     pub(super) pending_stream:
         OptionFuture<BoxFuture<'static, Result<Subscription<Event>, client::Error>>>,
     pub(super) event_stream: EventStream,
-    /// Requests for blocks while the actor is trying to establish a connection.
-    pub(super) waiters: Vec<(Height, oneshot::Sender<Option<CertifiedBlock>>)>,
+    /// Requests waiting for the actor to establish a connection.
+    pub(super) waiters: Vec<super::ingress::Message>,
 }
 
 impl<TContext> Actor<TContext>
@@ -78,7 +99,7 @@ where
                                 %reason,
                                 attempts,
                                 reconnect_in = %display_duration(reconnect_in),
-                                url = self.url,
+                                url = %self.url,
                                 "connecting to upstream node failed, attempting again",
                             ));
                             self.pending_connect.replace({
@@ -128,7 +149,7 @@ where
                         }
                         None => {
                             warn_span!("event_subscription").in_scope(|| warn!(
-                                url = self.url,
+                                url = %self.url,
                                 "event stream terminated",
                             ));
                             self.event_stream = inactive_event_stream();
@@ -136,12 +157,8 @@ where
                     }
                 }
 
-                Some(msg) = self.mailbox.recv() => {
-                    match msg {
-                        super::ingress::Message::GetFinalization { height, response, } => {
-                            self.waiters.push((height, response));
-                        }
-                    }
+                Some(request) = self.mailbox.recv() => {
+                    self.waiters.push(request);
                 }
             );
         }
@@ -165,13 +182,13 @@ where
         if client.is_connected() {
             self.pending_stream.replace(subscribe(client));
         } else {
-            warn!(url = self.url, "upstream client disconnected, reconnecting");
+            warn!(url = %self.url, "upstream client disconnected, reconnecting");
             self.connection.take();
             self.pending_connect.replace(connect(self.url, 1));
         }
     }
 
-    /// Drains the waiters by fetching the finalizations they are waiting for.
+    /// Drains the waiters by fetching the data they are waiting for.
     ///
     /// Only executes if a client is present and connected.
     fn drain_waiters(&mut self) {
@@ -189,21 +206,37 @@ where
             return;
         }
 
-        for (height, response) in self.waiters.drain(..) {
-            let client = client.clone();
-            self.context
-                .with_label("get_finalization")
-                .spawn(move |_| get_finalization(client, height, response));
+        for request in self.waiters.drain(..) {
+            match request {
+                super::ingress::Message::GetFinalization { height, response } => {
+                    let client = client.clone();
+                    self.context
+                        .with_label("get_finalization")
+                        .spawn(move |_| get_finalization(client, height, response));
+                }
+                super::ingress::Message::GetBlock { digest, response } => {
+                    let client = client.clone();
+                    self.context
+                        .with_label("get_block")
+                        .spawn(move |_| get_block(client, digest, response));
+                }
+            }
         }
     }
 }
 
-fn connect(url: &'static str, attempts: u64) -> BoxFuture<'static, (u64, eyre::Result<WsClient>)> {
+fn connect(url: &'static Url, attempts: u64) -> BoxFuture<'static, (u64, eyre::Result<WsClient>)> {
     async move {
         (
             attempts,
             WsClientBuilder::default()
-                .build(&url)
+                .enable_ws_ping(
+                    PingConfig::new()
+                        .ping_interval(PING_INTERVAL)
+                        .inactive_limit(PING_INACTIVE_LIMIT)
+                        .max_failures(PING_MAX_FAILURES),
+                )
+                .build(url)
                 .await
                 .map_err(Report::new),
         )
@@ -255,6 +288,40 @@ async fn get_finalization(
         .wrap_err("failed getting finalization")?;
     response
         .send(Some(finalization))
+        .map_err(|_| eyre::eyre!("receiver went away"))
+}
+
+/// Fetches a full consensus block from the upstream node.
+#[instrument(skip_all, fields(%digest), err)]
+async fn get_block(
+    client: Arc<WsClient>,
+    digest: Digest,
+    response: oneshot::Sender<Option<Block>>,
+) -> eyre::Result<()> {
+    let block = client
+        .request::<Option<RpcBlock<Transaction<TempoTxEnvelope>, TempoHeader>>, _>(
+            "eth_getBlockByHash",
+            rpc_params![digest.0, true],
+        )
+        .await
+        .wrap_err("failed getting block by hash")?
+        .map(|block| {
+            SealedOrRecoveredBlock::from(SealedBlock::seal_slow(
+                block
+                    .into_consensus_block()
+                    .map_transactions(|transaction| transaction.into_inner()),
+            ))
+        });
+
+    let block = block
+        .map(|block| {
+            ensure!(block.hash() == digest.0, "mismatched block hash");
+            Ok(Block::from_execution_block_unchecked(block, None))
+        })
+        .transpose()?;
+
+    response
+        .send(block)
         .map_err(|_| eyre::eyre!("receiver went away"))
 }
 

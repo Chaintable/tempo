@@ -4,6 +4,7 @@ on:
   pull_request:
     types: [opened, synchronize]
     paths:
+      - crates/hardfork/**
       - crates/contracts/**
       - crates/primitives/**
       - crates/chainspec/**
@@ -12,6 +13,7 @@ on:
 jobs:
   changelog:
     name: changelog
+    if: secrets.AMP_API_KEY != ''
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -25,7 +27,7 @@ jobs:
 
       - run: curl -fsSL https://ampcode.com/install.sh | bash
 
-      - uses: wevm/changelogs/check@b0179e7300997dfa5a631a6a7a2de248bf63310f # master
+      - uses: wevm/changelogs/check@466632795bfca34dc9bb7f7bcab9f50c6e3f3726 # master
         with:
           ai: 'amp -x'
           ecosystem: rust

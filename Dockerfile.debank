@@ -18,6 +18,12 @@ ARG TARGETARCH
 ARG RUST_PROFILE=release
 ARG RUST_FEATURES="asm-keccak,jemalloc"
 ARG EXTRA_RUSTFLAGS=""
+ARG VERGEN_GIT_SHA
+ARG VERGEN_GIT_SHA_SHORT
+
+ENV VERGEN_GIT_SHA=${VERGEN_GIT_SHA} \
+    VERGEN_GIT_SHA_SHORT=${VERGEN_GIT_SHA_SHORT} \
+    VERGEN_DEFAULT_ON_ERROR=1
 
 RUN apt-get update \
     && apt-get install --no-install-recommends -y \

@@ -10,7 +10,7 @@ use revm::{
     context::{Host as _, JournalTr, result::EVMError},
     context_interface::cfg::GasParams,
     interpreter::{
-        Gas, InstructionContext, InstructionResult, SStoreResult, StateLoad,
+        Gas, InstructionContext, InstructionResult, StateLoad,
         gas::GasTracker,
         instructions::host::{sstore_default_gas_accounting, sstore_with_gas_accounting},
         interpreter::EthInterpreter,
@@ -19,7 +19,7 @@ use revm::{
 use tempo_chainspec::constants::gas::STORAGE_CREDIT_VALUE;
 use tempo_precompiles::{
     STORAGE_CREDITS_ADDRESS,
-    storage::FromWord,
+    storage::{FromWord, SstoreTransitionFlags, StorageAction},
     storage_credits::{StorageCreditsBackend, TransientState, sstore_storage_credits},
 };
 
@@ -56,6 +56,8 @@ pub fn apply_refund<DB: Database, I>(
 
         // SLOAD the current persistent balance and settle pending refund-eligible creations against it.
         let old_word = journal.sload(STORAGE_CREDITS_ADDRESS, key)?.data;
+        evm.actions
+            .record(StorageAction::Sload(STORAGE_CREDITS_ADDRESS, key, old_word));
         let mut balance =
             u64::from_word(old_word).map_err(|err| EVMError::Custom(err.to_string()))?;
         let settled = pending.min(balance);
@@ -72,6 +74,12 @@ pub fn apply_refund<DB: Database, I>(
         debug_assert_ne!(new_word, old_word);
 
         journal.sstore(STORAGE_CREDITS_ADDRESS, key, new_word)?;
+        evm.actions.record(StorageAction::Sstore(
+            STORAGE_CREDITS_ADDRESS,
+            key,
+            old_word,
+            new_word,
+        ));
     }
 
     // Refund storage credit value per settled credit.
@@ -123,10 +131,11 @@ impl<DB: Database> StorageCreditsBackend for StorageCreditsContext<'_, DB> {
         key: U256,
         value: U256,
         skip_cold_load: bool,
-    ) -> Result<StateLoad<SStoreResult>, Self::Error> {
+    ) -> Result<SstoreTransitionFlags, Self::Error> {
         Ok(self
             .context
-            .sstore_skip_cold_load(address, key, value, skip_cold_load)?)
+            .sstore_skip_cold_load(address, key, value, skip_cold_load)?
+            .into())
     }
 
     #[inline]

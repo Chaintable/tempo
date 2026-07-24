@@ -15,7 +15,7 @@ use tempo_primitives::TempoBlockEnv;
 
 use crate::{
     Precompile,
-    error::{Result, TempoPrecompileError},
+    error::{IntoPrecompileResult, Result, TempoPrecompileError},
     storage::{PrecompileStorageProvider, StorageActions, evm::EvmPrecompileStorageProvider},
 };
 
@@ -221,6 +221,11 @@ impl StorageCtx {
         Self::with_storage(|s| s.spec())
     }
 
+    /// Returns the shared storage-actions recorder for the current storage context.
+    pub fn actions(&self) -> StorageActions {
+        Self::with_storage(|s| s.storage_actions())
+    }
+
     /// Mirrors `CfgEnv::enable_amsterdam_eip8037`. Used by precompiles to gate the TIP-1016
     /// regular/state gas split independently of the active hardfork.
     pub fn amsterdam_eip8037_enabled(&self) -> bool {
@@ -311,11 +316,9 @@ impl StorageCtx {
         PrecompileOutput::halt(halt, self.reservoir())
     }
 
-    /// Returns a [`PrecompileResult`] constructed from the given [`TempoPrecompileError`].
-    pub fn error_result(&self, error: impl Into<TempoPrecompileError>) -> PrecompileResult {
-        error
-            .into()
-            .into_precompile_result(self.gas_used(), self.reservoir())
+    /// Returns a [`PrecompileResult`] constructed from the given error.
+    pub fn error_result(&self, error: impl IntoPrecompileResult) -> PrecompileResult {
+        error.into_precompile_result(self.gas_used(), self.reservoir())
     }
 }
 
