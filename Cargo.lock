@@ -3790,6 +3790,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "debank-rpc"
+version = "1.11.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips",
+ "alloy-genesis",
+ "alloy-network",
+ "alloy-primitives",
+ "alloy-rlp",
+ "alloy-rpc-types-eth",
+ "alloy-rpc-types-trace",
+ "alloy-sol-types",
+ "async-trait",
+ "futures",
+ "jsonrpsee",
+ "md-5",
+ "reth-chainspec",
+ "reth-evm",
+ "reth-primitives-traits",
+ "reth-provider",
+ "reth-revm",
+ "reth-rpc-convert",
+ "reth-rpc-eth-api",
+ "reth-rpc-eth-types",
+ "revm",
+ "revm-inspectors",
+ "serde",
+ "serde_json",
+ "sha1",
+]
+
+[[package]]
 name = "debug-helper"
 version = "0.3.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6601,6 +6633,16 @@ name = "matchit"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
+
+[[package]]
+name = "md-5"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
+dependencies = [
+ "cfg-if",
+ "digest 0.10.7",
+]
 
 [[package]]
 name = "memchr"
@@ -13261,6 +13303,7 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "commonware-runtime",
+ "debank-rpc",
  "eyre",
  "futures",
  "indexmap 2.14.0",
