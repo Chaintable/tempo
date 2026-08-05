@@ -540,14 +540,14 @@ where
 
         let bal_task_handle = if self.enable_bal {
             let bal_task_handle =
-                self.spawn_bal_task(trie_handle.as_ref().map(|handle| handle.state_hook()));
+                self.spawn_bal_task(trie_handle.as_mut().map(|handle| handle.state_hook()));
             executor
                 .evm_mut()
                 .db_mut()
                 .set_state_hook(Some(Box::new(bal_task_handle.state_hook())));
             Some(bal_task_handle)
         } else {
-            if let Some(ref handle) = trie_handle {
+            if let Some(handle) = trie_handle.as_mut() {
                 executor
                     .evm_mut()
                     .db_mut()
@@ -1021,7 +1021,7 @@ where
 
         let hashed_state = if let Some(Ok(hashed_state)) = trie_handle
             .as_mut()
-            .map(|rx| rx.take_hashed_state_rx().recv())
+            .map(|handle| handle.take_hashed_state_rx().recv())
         {
             hashed_state
         } else {
