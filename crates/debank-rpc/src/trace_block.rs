@@ -215,6 +215,9 @@ where
         let Some(block) = block else {
             return Err(EthApiError::HeaderNotFound(block_id).into());
         };
+        // Resolve dynamic tags such as `latest` once. Every subsequent lookup must refer to the
+        // same block even if the canonical head advances while this RPC is running.
+        let resolved_block_id = BlockId::hash(block.hash());
 
         let debank_block = DebankBlock {
             id: block.hash(),
@@ -288,7 +291,7 @@ where
         // Build DebankTransactions from receipts
         use alloy_network::ReceiptResponse;
 
-        let receipts = self.eth_api.block_receipts(block_id).await?;
+        let receipts = self.eth_api.block_receipts(resolved_block_id).await?;
         let Some(receipts) = receipts else {
             return Err(EthApiError::HeaderNotFound(block_id).into());
         };
@@ -440,16 +443,16 @@ where
         };
 
         // Prepare block replay
-        // No empty block shortcut: Tempo has a system tx in every block
-        // (subblock metadata, gas=0) that doesn't change state but has a
-        // trace in trace_transaction. Always replay to stay consistent.
+        // No empty block shortcut: Tempo can change state in block-level pre/post execution even
+        // when the transaction list is empty (for example, hardfork activation deployments).
+        // Pre-T4 blocks can also contain a subblock metadata system transaction.
         let block_state_root = block.state_root();
         let parent_state_root = parent_block.state_root();
 
         // Collect tx hashes before move
         let tx_hashes: Vec<B256> = block_txs.iter().map(|tx| *tx.tx_hash()).collect();
 
-        let (evm_env, _) = self.eth_api.evm_env_at(block_id).await?;
+        let (evm_env, _) = self.eth_api.evm_env_at(resolved_block_id).await?;
 
         let parent_block_id = BlockId::hash(parent_hash);
         let tx_statuses_clone = tx_statuses.clone();
@@ -510,6 +513,20 @@ where
                     );
                     let arena = inspector.into_traces();
                     let native_storage_changes = native_storage_inspector.into_changes();
+                    let native_changes_match_arena = arena.nodes().len()
+                        == native_storage_changes.len()
+                        && arena
+                            .nodes()
+                            .iter()
+                            .zip(&native_storage_changes)
+                            .all(|(node, (address, _))| node.trace.address == *address);
+                    if !native_changes_match_arena {
+                        return Err(Eth::Error::from_eth_err(BlockExecutionError::msg(format!(
+                            "trace_debankBlock native inspector mismatch for transaction {tx_hash}: trace nodes {}, native frames {}",
+                            arena.nodes().len(),
+                            native_storage_changes.len(),
+                        ))));
+                    }
                     let (traces, error_traces, events, error_events) =
                         build_debank_traces(
                             tx_hash,
