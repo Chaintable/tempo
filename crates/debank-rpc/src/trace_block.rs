@@ -29,7 +29,9 @@ use revm::{
     database::states::bundle_state::BundleRetention,
     interpreter::{CallInputs, CallOutcome, CallScheme, CreateInputs, CreateOutcome},
 };
-use revm_inspectors::tracing::{OpcodeFilter, TracingInspector, TracingInspectorConfig};
+use revm_inspectors::tracing::{
+    CallTraceArena, OpcodeFilter, TracingInspector, TracingInspectorConfig,
+};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     mem,
@@ -53,7 +55,7 @@ struct NativeCallFrame {
 ///
 /// Native precompiles write through the journal directly, so they do not execute an SSTORE opcode
 /// that [`TracingInspector`] can attach to a call trace. Call records are kept in the same
-/// insertion order as the tracing arena and merged into the DeBank trace after execution.
+/// insertion order as real tracing arena nodes and merged into the DeBank trace after execution.
 #[derive(Debug, Default)]
 struct NativeStorageChangeInspector {
     frames: Vec<NativeCallFrame>,
@@ -165,6 +167,54 @@ fn new_debank_inspector() -> DebankInspector {
         TracingInspector::new(trace_cfg),
         NativeStorageChangeInspector::default(),
     )
+}
+
+/// Aligns native inspector calls with tracing arena nodes.
+///
+/// Standard transactions enter the EVM at journal depth zero, so the first inspector call fills
+/// arena node zero and both inspectors have the same number of records. Tempo AA transactions
+/// execute their calls at depth one under a synthetic transaction root. `TracingInspector` keeps
+/// its preallocated node zero for that root, but no `Inspector::call` callback exists for it. The
+/// only accepted offset is therefore one verified synthetic root followed by an exact address
+/// match for every real call/create frame.
+fn align_native_storage_changes(
+    arena: &mut CallTraceArena,
+    native_changes: Vec<(Address, bool)>,
+    tx_success: bool,
+) -> Option<Vec<(Address, bool)>> {
+    let nodes = arena.nodes();
+    let trace_node_count = nodes.len();
+    if trace_node_count == native_changes.len()
+        && nodes
+            .iter()
+            .zip(&native_changes)
+            .all(|(node, (address, _))| node.trace.address == *address)
+    {
+        return Some(native_changes);
+    }
+
+    let has_synthetic_root = trace_node_count == native_changes.len() + 1
+        && nodes.first().is_some_and(|root| {
+            root.parent.is_none()
+                && root.trace.depth == 0
+                && root.trace.address.is_zero()
+                && root.trace.data.is_empty()
+                && root.trace.value.is_zero()
+                && root.trace.status.is_none()
+        })
+        && nodes[1..]
+            .iter()
+            .zip(&native_changes)
+            .all(|(node, (address, _))| node.trace.address == *address);
+    if !has_synthetic_root {
+        return None;
+    }
+
+    arena.nodes_mut()[0].trace.success = tx_success;
+    let mut aligned = Vec::with_capacity(trace_node_count);
+    aligned.push((Address::ZERO, false));
+    aligned.extend(native_changes);
+    Some(aligned)
 }
 
 fn root_trace_misclassified(error_traces: &[DebankTrace]) -> bool {
@@ -510,6 +560,8 @@ where
         // from the receipts produced by the replay executor below, so they are covered by the
         // receipts-root validation rather than a fallible RPC serde round-trip.
         let tx_statuses: Vec<bool> = receipts.iter().map(|r| r.status()).collect();
+        let replay_tx_statuses = tx_statuses.clone();
+        let tx_gas_used: Vec<u64> = receipts.iter().map(|r| r.gas_used()).collect();
 
         let parent_hash = block.parent_hash();
         let parent_block = self.eth_api.recovered_block(parent_hash.into()).await?;
@@ -588,26 +640,26 @@ where
                         .execute_transaction_without_commit(tx)
                         .map_err(Eth::Error::from_eth_err)?;
 
-                    let (inspector, native_storage_inspector) = mem::replace(
+                    let (mut inspector, native_storage_inspector) = mem::replace(
                         executor.evm_mut().components_mut().1,
                         new_debank_inspector(),
                     );
-                    let arena = inspector.into_traces();
-                    let native_storage_changes = native_storage_inspector.into_changes();
-                    let native_changes_match_arena = arena.nodes().len()
-                        == native_storage_changes.len()
-                        && arena
-                            .nodes()
-                            .iter()
-                            .zip(&native_storage_changes)
-                            .all(|(node, (address, _))| node.trace.address == *address);
-                    if !native_changes_match_arena {
+                    inspector.set_transaction_gas_limit(tx.gas_limit());
+                    inspector.set_transaction_gas_used(tx_gas_used[idx]);
+                    inspector.set_transaction_caller(Address::from(*tx.signer()));
+                    let mut arena = inspector.into_traces();
+                    let raw_native_storage_changes = native_storage_inspector.into_changes();
+                    let trace_node_count = arena.nodes().len();
+                    let native_frame_count = raw_native_storage_changes.len();
+                    let Some(native_storage_changes) = align_native_storage_changes(
+                        &mut arena,
+                        raw_native_storage_changes,
+                        replay_tx_statuses[idx],
+                    ) else {
                         return Err(Eth::Error::from_eth_err(BlockExecutionError::msg(format!(
-                            "trace_debankBlock native inspector mismatch for transaction {tx_hash}: trace nodes {}, native frames {}",
-                            arena.nodes().len(),
-                            native_storage_changes.len(),
+                            "trace_debankBlock native inspector mismatch for transaction {tx_hash}: trace nodes {trace_node_count}, native frames {native_frame_count}",
                         ))));
-                    }
+                    };
                     let inspector_log_index = std::cell::RefCell::new(0usize);
                     let (traces, error_traces, events, error_events) =
                         build_debank_traces(
@@ -866,6 +918,7 @@ mod tests {
         Context,
         database::{CacheDB, EmptyDB},
     };
+    use revm_inspectors::tracing::types::{CallTrace, CallTraceNode, TraceMemberOrder};
     use tempo_evm::TempoBlockEnv;
     use tempo_revm::TempoTxEnv;
 
@@ -894,6 +947,36 @@ mod tests {
             inspector.into_changes(),
             vec![(root, false), (precompile, true)]
         );
+    }
+
+    #[test]
+    fn native_changes_align_with_verified_aa_synthetic_root() {
+        let precompile = Address::repeat_byte(0x22);
+        let mut arena = CallTraceArena::default();
+        arena.nodes_mut()[0].children = vec![1];
+        arena.nodes_mut()[0].ordering = vec![TraceMemberOrder::Call(0)];
+        arena.nodes_mut().push(CallTraceNode {
+            parent: Some(0),
+            idx: 1,
+            trace: CallTrace {
+                depth: 1,
+                address: precompile,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let mut invalid_arena = arena.clone();
+        invalid_arena.nodes_mut()[0].trace.address = Address::repeat_byte(0x11);
+        assert!(
+            align_native_storage_changes(&mut invalid_arena, vec![(precompile, true)], true,)
+                .is_none()
+        );
+
+        let aligned =
+            align_native_storage_changes(&mut arena, vec![(precompile, true)], true).unwrap();
+        assert!(arena.nodes()[0].trace.success);
+        assert_eq!(aligned, vec![(Address::ZERO, false), (precompile, true)]);
     }
 
     #[test]
