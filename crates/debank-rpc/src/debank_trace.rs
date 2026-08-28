@@ -8,6 +8,8 @@ use alloy_primitives::{
 };
 use alloy_rlp::{RlpDecodable, RlpEncodable};
 use alloy_rpc_types_eth::Header;
+use reth_db_api::models::{AccountBeforeTx, BlockNumberAddress};
+use reth_primitives_traits::StorageEntry;
 use reth_revm::db::BundleState;
 use revm::DatabaseRef;
 use revm_inspectors::tracing::{
@@ -16,7 +18,10 @@ use revm_inspectors::tracing::{
 };
 use serde::{Deserialize, Serialize};
 use sha1::{Digest as Sha1Digest, Sha1};
-use std::str::FromStr;
+use std::{
+    collections::{BTreeMap, BTreeSet, HashSet},
+    str::FromStr,
+};
 
 // ---------------------------------------------------------------------------
 // State diff types (RLP-encoded for S3 storage)
@@ -630,12 +635,26 @@ pub fn build_debank_traces(
 // ---------------------------------------------------------------------------
 
 pub fn get_storage_contracts_from_bundle(bundle: &BundleState) -> Vec<Address> {
-    bundle
+    let mut addresses = bundle
         .state
         .iter()
         .filter(|(_, account)| !account.storage.is_empty())
         .map(|(address, _)| *address)
-        .collect()
+        .collect::<Vec<_>>();
+    addresses.sort_unstable();
+    addresses
+}
+
+fn sort_block_storage_diff(diff: &mut BlockStorageDiff) {
+    diff.new_accounts
+        .sort_unstable_by_key(|account| account.address);
+    diff.deleted_accounts.sort_unstable();
+    for account in &mut diff.storage_diffs {
+        account.diffs.sort_unstable_by_key(|slot| slot.index);
+    }
+    diff.storage_diffs
+        .sort_unstable_by_key(|account| account.address);
+    diff.new_codes.sort_unstable_by_key(|code| code.code_hash);
 }
 
 pub fn get_storage_diffs_from_bundle<DB: DatabaseRef>(
@@ -646,11 +665,13 @@ pub fn get_storage_diffs_from_bundle<DB: DatabaseRef>(
     let mut deleted_accounts = Vec::new();
     let mut storage_diffs = Vec::new();
     let mut new_codes = Vec::new();
-    let mut seen_new_code_hashes = std::collections::HashSet::new();
+    let mut seen_new_code_hashes = HashSet::new();
 
     for (address, account) in bundle.state {
         let was_destroyed = account.was_destroyed();
-        if was_destroyed {
+        let had_parent_account = account.original_info.is_some();
+        let storage_was_wiped = was_destroyed && had_parent_account;
+        if was_destroyed && had_parent_account {
             // Leafage applies deletions before new account/storage values. A contract destroyed and
             // recreated in the same block therefore needs both records so stale parent storage is
             // cleared before the recreated state is installed.
@@ -658,39 +679,54 @@ pub fn get_storage_diffs_from_bundle<DB: DatabaseRef>(
         }
 
         let Some(info) = account.info else {
-            if !was_destroyed {
+            if had_parent_account && !was_destroyed {
                 deleted_accounts.push(keccak256(address.0));
             }
             continue;
         };
 
-        new_accounts.push(NewAccount {
-            address: keccak256(address.0),
-            balance: info.balance,
-            nonce: info.nonce,
-            code_hash: info.code_hash,
-        });
-
-        if !account.storage.is_empty() {
-            let diffs: Vec<IndexValuePair> = account
-                .storage
-                .into_iter()
-                .filter(|(_, slot)| slot.present_value != slot.previous_or_original_value)
-                .map(|(key, slot)| IndexValuePair {
-                    index: keccak256::<[u8; 32]>(key.to_be_bytes()),
-                    value: slot.present_value,
-                })
-                .collect();
-            if !diffs.is_empty() {
-                storage_diffs.push(AccountStorageDiff {
-                    address: keccak256(address.0),
-                    diffs,
-                });
-            }
+        let diffs = account
+            .storage
+            .into_iter()
+            .filter(|(_, slot)| {
+                if storage_was_wiped {
+                    !slot.present_value.is_zero()
+                } else {
+                    slot.present_value != slot.previous_or_original_value
+                }
+            })
+            .map(|(key, slot)| IndexValuePair {
+                index: keccak256::<[u8; 32]>(key.to_be_bytes()),
+                value: slot.present_value,
+            })
+            .collect::<Vec<_>>();
+        let has_storage_changes = !diffs.is_empty();
+        if has_storage_changes {
+            storage_diffs.push(AccountStorageDiff {
+                address: keccak256(address.0),
+                diffs,
+            });
         }
 
-        if let Some(code) = info.code {
+        let account_changed = account.original_info.as_ref().is_none_or(|original| {
+            original.balance != info.balance
+                || original.nonce != info.nonce
+                || original.code_hash != info.code_hash
+        });
+        if account_changed || has_storage_changes || (was_destroyed && had_parent_account) {
+            new_accounts.push(NewAccount {
+                address: keccak256(address.0),
+                balance: info.balance,
+                nonce: info.nonce,
+                code_hash: info.code_hash,
+            });
+        }
+
+        if let Some(code) = info.code.as_ref() {
             let code_hash = info.code_hash;
+            if code_hash == KECCAK_EMPTY {
+                continue;
+            }
             if let Ok(Some(account)) = pre_db.basic_ref(address)
                 && account.code_hash == code_hash
             {
@@ -706,14 +742,122 @@ pub fn get_storage_diffs_from_bundle<DB: DatabaseRef>(
         }
     }
 
-    BlockStorageDiff {
+    let mut diff = BlockStorageDiff {
         hash: H256::ZERO,
         parent_hash: H256::ZERO,
         new_accounts,
         deleted_accounts,
         storage_diffs,
         new_codes,
+    };
+    sort_block_storage_diff(&mut diff);
+    diff
+}
+
+pub fn get_storage_diffs_from_changesets<DB: DatabaseRef>(
+    account_changesets: Vec<AccountBeforeTx>,
+    storage_changesets: Vec<(BlockNumberAddress, StorageEntry)>,
+    destroyed_addresses: &HashSet<Address>,
+    post_db: DB,
+) -> Result<BlockStorageDiff, DB::Error> {
+    let mut new_accounts = Vec::new();
+    let mut deleted_accounts = BTreeSet::new();
+    let mut storage_diffs = Vec::new();
+    let mut new_codes = Vec::new();
+    let mut changed_code_hashes = BTreeSet::new();
+    let mut account_pre_state = BTreeMap::new();
+    let mut changed_addresses = BTreeSet::new();
+
+    for account in account_changesets {
+        changed_addresses.insert(account.address);
+        account_pre_state.insert(account.address, account.info.map(Into::into));
     }
+
+    let mut storage_by_address: BTreeMap<Address, Vec<IndexValuePair>> = BTreeMap::new();
+    for (block_address, entry) in storage_changesets {
+        let address = block_address.address();
+        let final_value = post_db.storage_ref(address, U256::from_be_bytes(entry.key.0))?;
+        let storage_was_wiped = destroyed_addresses.contains(&address);
+        if (storage_was_wiped && !final_value.is_zero())
+            || (!storage_was_wiped && final_value != entry.value)
+        {
+            changed_addresses.insert(address);
+            storage_by_address
+                .entry(address)
+                .or_default()
+                .push(IndexValuePair {
+                    index: keccak256::<[u8; 32]>(entry.key.0),
+                    value: final_value,
+                });
+        }
+    }
+
+    changed_addresses.extend(destroyed_addresses);
+    for address in changed_addresses {
+        let post_account = post_db.basic_ref(address)?;
+        let pre_account = account_pre_state
+            .get(&address)
+            .cloned()
+            .unwrap_or_else(|| post_account.clone());
+        let was_destroyed = destroyed_addresses.contains(&address) && pre_account.is_some();
+        if was_destroyed {
+            deleted_accounts.insert(keccak256(address.0));
+        }
+
+        let diffs = storage_by_address.remove(&address).unwrap_or_default();
+        let has_storage_changes = !diffs.is_empty();
+        if has_storage_changes {
+            storage_diffs.push(AccountStorageDiff {
+                address: keccak256(address.0),
+                diffs,
+            });
+        }
+
+        let Some(info) = post_account else {
+            if pre_account.is_some() {
+                deleted_accounts.insert(keccak256(address.0));
+            }
+            continue;
+        };
+
+        let account_changed = pre_account.as_ref().is_none_or(|original| {
+            original.balance != info.balance
+                || original.nonce != info.nonce
+                || original.code_hash != info.code_hash
+        });
+        if account_changed || has_storage_changes || was_destroyed {
+            if pre_account.as_ref().map(|account| account.code_hash) != Some(info.code_hash) {
+                changed_code_hashes.insert(info.code_hash);
+            }
+            new_accounts.push(NewAccount {
+                address: keccak256(address.0),
+                balance: info.balance,
+                nonce: info.nonce,
+                code_hash: info.code_hash,
+            });
+        }
+    }
+
+    for code_hash in changed_code_hashes {
+        if code_hash != KECCAK_EMPTY {
+            let code = post_db.code_by_hash_ref(code_hash)?;
+            new_codes.push(NewCode {
+                code_hash,
+                code: code.original_bytes(),
+            });
+        }
+    }
+
+    let mut diff = BlockStorageDiff {
+        hash: H256::ZERO,
+        parent_hash: H256::ZERO,
+        new_accounts,
+        deleted_accounts: deleted_accounts.into_iter().collect(),
+        storage_diffs,
+        new_codes,
+    };
+    sort_block_storage_diff(&mut diff);
+    Ok(diff)
 }
 
 // ---------------------------------------------------------------------------
@@ -909,6 +1053,7 @@ mod tests {
         let recreated = Address::repeat_byte(0x44);
         let changed_slot = U256::from(1);
         let restored_slot = U256::from(2);
+        let recreated_slot = U256::from(3);
         let code = Bytes::from(vec![0x60, 0x00, 0x56]);
         let code_hash = keccak256(&code);
         let code = Bytecode::new_raw(code);
@@ -955,7 +1100,9 @@ mod tests {
                         code: Some(code),
                         ..Default::default()
                     }),
-                    Default::default(),
+                    [(recreated_slot, (U256::from(7), U256::from(7)))]
+                        .into_iter()
+                        .collect(),
                 ),
                 (deleted, Some(original), None, Default::default()),
             ],
@@ -964,9 +1111,67 @@ mod tests {
         );
         bundle.state.get_mut(&recreated).unwrap().status = AccountStatus::DestroyedChanged;
 
-        assert_eq!(get_storage_contracts_from_bundle(&bundle), vec![changed]);
+        assert_eq!(
+            get_storage_contracts_from_bundle(&bundle),
+            vec![changed, recreated]
+        );
 
+        let mut post_db = InMemoryDB::new(EmptyDB::default());
+        for address in [changed, clone, recreated] {
+            post_db.insert_account_info(address, bundle.state[&address].info.clone().unwrap());
+        }
+        post_db
+            .insert_account_storage(changed, changed_slot, U256::from(4))
+            .unwrap();
+        post_db
+            .insert_account_storage(changed, restored_slot, U256::from(5))
+            .unwrap();
+        post_db
+            .insert_account_storage(recreated, recreated_slot, U256::from(7))
+            .unwrap();
+        let account_changesets = [changed, clone, recreated, deleted]
+            .into_iter()
+            .map(|address| AccountBeforeTx {
+                address,
+                info: bundle.state[&address]
+                    .original_info
+                    .as_ref()
+                    .map(Into::into),
+            })
+            .collect();
+        let storage_changesets = vec![
+            (
+                (1, changed).into(),
+                StorageEntry {
+                    key: H256::from(changed_slot.to_be_bytes()),
+                    value: U256::from(3),
+                },
+            ),
+            (
+                (1, changed).into(),
+                StorageEntry {
+                    key: H256::from(restored_slot.to_be_bytes()),
+                    value: U256::from(5),
+                },
+            ),
+            (
+                (1, recreated).into(),
+                StorageEntry {
+                    key: H256::from(recreated_slot.to_be_bytes()),
+                    value: U256::from(7),
+                },
+            ),
+        ];
+        let destroyed_addresses = HashSet::from([deleted, recreated]);
+        let canonical_diff = get_storage_diffs_from_changesets(
+            account_changesets,
+            storage_changesets,
+            &destroyed_addresses,
+            post_db,
+        )
+        .unwrap();
         let diff = get_storage_diffs_from_bundle(bundle, &InMemoryDB::new(EmptyDB::default()));
+        assert_eq!(diff, canonical_diff);
         assert_eq!(diff.new_accounts.len(), 3);
         assert!(
             diff.new_accounts
@@ -991,6 +1196,19 @@ mod tests {
                 index: keccak256::<[u8; 32]>(changed_slot.to_be_bytes()),
                 value: U256::from(4),
             }
+        );
+
+        let recreated_storage = diff
+            .storage_diffs
+            .iter()
+            .find(|account| account.address == keccak256(recreated.0))
+            .unwrap();
+        assert_eq!(
+            recreated_storage.diffs,
+            vec![IndexValuePair {
+                index: keccak256::<[u8; 32]>(recreated_slot.to_be_bytes()),
+                value: U256::from(7),
+            }]
         );
     }
 

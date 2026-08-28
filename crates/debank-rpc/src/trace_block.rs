@@ -5,7 +5,7 @@
 
 use alloy_consensus::{BlockHeader, Transaction, TxReceipt, transaction::TxHashRef};
 use alloy_eips::BlockId;
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{Address, B256, U256, keccak256};
 use alloy_rpc_types_eth::Header;
 use jsonrpsee::core::RpcResult;
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
@@ -21,6 +21,7 @@ use reth_rpc_eth_api::{
     },
 };
 use reth_rpc_eth_types::{EthApiError, cache::db::StateProviderTraitObjWrapper};
+use reth_storage_api::{ChangeSetReader, StorageChangeSetReader};
 use revm::{
     Database, Inspector, JournalEntry,
     bytecode::opcode::OpCode,
@@ -30,7 +31,7 @@ use revm::{
 };
 use revm_inspectors::tracing::{OpcodeFilter, TracingInspector, TracingInspectorConfig};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     mem,
     str::FromStr,
 };
@@ -315,7 +316,9 @@ where
         + SpawnBlocking
         + TraceExt
         + 'static,
-    Eth::Provider: ChainSpecProvider<ChainSpec: EthChainSpec + EthereumHardforks>,
+    Eth::Provider: ChainSpecProvider<ChainSpec: EthChainSpec + EthereumHardforks>
+        + ChangeSetReader
+        + StorageChangeSetReader,
 {
     /// Build `DebankOutPut` for the given block.
     async fn trace_debank_block(&self, block_id: BlockId) -> Result<DebankOutPut, Eth::Error> {
@@ -538,6 +541,9 @@ where
             .eth_api
             .spawn_blocking_io_fut(move |eth_api| async move {
                 let parent_state = eth_api.state_at_block_id(parent_block_id).await?;
+                let post_state = eth_api
+                    .state_at_block_id(BlockId::hash(block.hash()))
+                    .await?;
                 let mut replay_state = State::builder()
                     .with_database(StateProviderDatabase::new(StateProviderTraitObjWrapper(
                         parent_state,
@@ -671,22 +677,59 @@ where
 
                 replay_state.merge_transitions(BundleRetention::PlainState);
                 let bundle_state = replay_state.take_bundle();
-                let parent_state_provider = &replay_state.database.0.0;
-                let hashed_state = parent_state_provider.hashed_post_state(&bundle_state);
-                let replayed_state_root = parent_state_provider
-                    .state_root(hashed_state)
+                let change_addresses = get_storage_contracts_from_bundle(&bundle_state);
+                let destroyed_addresses = bundle_state
+                    .state
+                    .iter()
+                    .filter_map(|(address, account)| {
+                        (account.was_destroyed() && account.original_info.is_some())
+                            .then_some(*address)
+                    })
+                    .collect::<HashSet<_>>();
+                let replayed_state_diff =
+                    get_storage_diffs_from_bundle(bundle_state, &replay_state.database);
+
+                let account_changesets = eth_api
+                    .provider()
+                    .account_block_changeset(block.number())
                     .map_err(Eth::Error::from_eth_err)?;
-                if replayed_state_root != block_state_root {
+                let storage_changesets = eth_api
+                    .provider()
+                    .storage_changeset(block.number())
+                    .map_err(Eth::Error::from_eth_err)?;
+                let canonical_state_diff = get_storage_diffs_from_changesets(
+                    account_changesets,
+                    storage_changesets,
+                    &destroyed_addresses,
+                    StateProviderDatabase::new(StateProviderTraitObjWrapper(post_state)),
+                )
+                .map_err(|err| {
+                    Eth::Error::from_eth_err(BlockExecutionError::msg(format!(
+                        "trace_debankBlock failed to build canonical state diff for block {}: {err}",
+                        block.number(),
+                    )))
+                })?;
+
+                if replayed_state_diff != canonical_state_diff {
+                    let replayed_hash = keccak256(alloy_rlp::encode(&replayed_state_diff));
+                    let canonical_hash = keccak256(alloy_rlp::encode(&canonical_state_diff));
                     return Err(Eth::Error::from_eth_err(BlockExecutionError::msg(format!(
-                        "trace_debankBlock state root mismatch for block {}: replayed {}, header {}",
-                        block.number(), replayed_state_root, block_state_root,
+                        "trace_debankBlock state diff mismatch for block {}: replayed {} (accounts {}, deleted {}, storage {}, codes {}), canonical {} (accounts {}, deleted {}, storage {}, codes {})",
+                        block.number(),
+                        replayed_hash,
+                        replayed_state_diff.new_accounts.len(),
+                        replayed_state_diff.deleted_accounts.len(),
+                        replayed_state_diff.storage_diffs.len(),
+                        replayed_state_diff.new_codes.len(),
+                        canonical_hash,
+                        canonical_state_diff.new_accounts.len(),
+                        canonical_state_diff.deleted_accounts.len(),
+                        canonical_state_diff.storage_diffs.len(),
+                        canonical_state_diff.new_codes.len(),
                     ))));
                 }
 
-                let change_addresses = get_storage_contracts_from_bundle(&bundle_state);
-                let state_diff =
-                    get_storage_diffs_from_bundle(bundle_state, &replay_state.database);
-                Ok((all_results, state_diff, change_addresses))
+                Ok((all_results, canonical_state_diff, change_addresses))
             })
             .await?;
 
@@ -792,7 +835,9 @@ where
         + SpawnBlocking
         + TraceExt
         + 'static,
-    Eth::Provider: ChainSpecProvider<ChainSpec: EthChainSpec + EthereumHardforks>,
+    Eth::Provider: ChainSpecProvider<ChainSpec: EthChainSpec + EthereumHardforks>
+        + ChangeSetReader
+        + StorageChangeSetReader,
 {
     async fn trace_debank_block(&self, block_id: BlockId) -> RpcResult<DebankOutPut> {
         let _permit = self
