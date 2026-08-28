@@ -331,19 +331,7 @@ pub(crate) fn fmt_error_msg(res: revm::interpreter::InstructionResult) -> Option
 impl From<&CallTraceNode> for DebankTrace {
     fn from(call_trace: &CallTraceNode) -> Self {
         let trace = &call_trace.trace;
-        let call_create_type = match trace.kind {
-            CallKind::Call
-            | CallKind::StaticCall
-            | CallKind::CallCode
-            | CallKind::DelegateCall
-            | CallKind::AuthCall => "call".to_string(),
-            CallKind::Create => "create".to_string(),
-            CallKind::Create2 => "create2".to_string(),
-        };
-        let mut call_type = String::new();
-        if call_create_type == "call" {
-            call_type = trace.kind.to_string().to_lowercase();
-        }
+        let (call_create_type, call_type) = debank_call_types(trace.kind);
         let error = trace.status.and_then(fmt_error_msg);
         let mut debank_trace = Self {
             from_addr: trace.caller,
@@ -353,8 +341,8 @@ impl From<&CallTraceNode> for DebankTrace {
             value: trace.value,
             gas_used: trace.gas_used,
             output: trace.output.clone(),
-            call_create_type,
-            call_type,
+            call_create_type: call_create_type.to_string(),
+            call_type: call_type.to_string(),
             subtraces: call_trace.children.len(),
             error: error.unwrap_or_default(),
             ..Default::default()
@@ -367,6 +355,17 @@ impl From<&CallTraceNode> for DebankTrace {
             }
         }
         debank_trace
+    }
+}
+
+fn debank_call_types(kind: CallKind) -> (&'static str, &'static str) {
+    match kind {
+        CallKind::Call => ("call", "call"),
+        CallKind::StaticCall => ("call", "staticcall"),
+        CallKind::CallCode => ("call", "callcode"),
+        CallKind::DelegateCall => ("call", "delegatecall"),
+        CallKind::AuthCall => ("call", "authcall"),
+        CallKind::Create | CallKind::Create2 => ("create", ""),
     }
 }
 
@@ -435,6 +434,8 @@ struct DebankTraceNode {
     success: bool,
 }
 
+const PARENT_CALL_FAILED_ERROR: &str = "parent call failed";
+
 #[allow(clippy::too_many_arguments)]
 fn build_trace_node(
     tx_id: String,
@@ -447,8 +448,12 @@ fn build_trace_node(
     trace_address: Vec<usize>,
     log_index: &mut usize,
 ) -> DebankTraceNode {
+    let mut trace: DebankTrace = node.into();
+    if !parent_success && trace.error.is_empty() {
+        trace.error = PARENT_CALL_FAILED_ERROR.to_string();
+    }
     let mut debank_node = DebankTraceNode {
-        trace: node.into(),
+        trace,
         children: Vec::new(),
         success: node.trace.success && parent_success,
     };
@@ -539,6 +544,9 @@ fn build_trace_node(
             call_create_type: "suicide".to_string(),
             ..Default::default()
         };
+        if !debank_node.success {
+            selfdestruct_trace.error = PARENT_CALL_FAILED_ERROR.to_string();
+        }
         selfdestruct_trace.id = selfdestruct_trace.debank_id();
         debank_node
             .children
@@ -672,9 +680,9 @@ pub fn get_storage_diffs_from_bundle<DB: DatabaseRef>(
         let had_parent_account = account.original_info.is_some();
         let storage_was_wiped = was_destroyed && had_parent_account;
         if was_destroyed && had_parent_account {
-            // Leafage applies deletions before new account/storage values. A contract destroyed and
-            // recreated in the same block therefore needs both records so stale parent storage is
-            // cleared before the recreated state is installed.
+            // The state-diff format represents a storage-wide wipe through `deleted_accounts`.
+            // A contract destroyed and recreated in the same block therefore needs both the
+            // deletion marker and its final account/storage values.
             deleted_accounts.push(keccak256(address.0));
         }
 
@@ -865,12 +873,14 @@ pub fn get_storage_diffs_from_changesets<DB: DatabaseRef>(
 // ---------------------------------------------------------------------------
 
 pub fn get_storage_contracts_from_genesis(genesis: &alloy_genesis::Genesis) -> Vec<Address> {
-    genesis
+    let mut storage_contracts = genesis
         .alloc
         .iter()
         .filter(|(_, account)| account.storage.is_some())
         .map(|(address, _)| *address)
-        .collect()
+        .collect::<Vec<_>>();
+    storage_contracts.sort_unstable();
+    storage_contracts
 }
 
 impl From<&alloy_genesis::Genesis> for BlockStorageDiff {
@@ -915,15 +925,27 @@ impl From<&alloy_genesis::Genesis> for BlockStorageDiff {
             }
         }
 
-        Self {
+        let mut state_diff = Self {
             hash: H256::ZERO,
             parent_hash: alloy_consensus::constants::EMPTY_ROOT_HASH,
             new_accounts,
             deleted_accounts: vec![],
             storage_diffs,
             new_codes,
-        }
+        };
+        sort_block_storage_diff(&mut state_diff);
+        state_diff
     }
+}
+
+/// Build a canonical bytes32 ID for a synthetic genesis transaction.
+///
+/// Layout: one-byte kind, eleven zero bytes, then the twenty-byte address.
+fn genesis_tx_id(kind: u8, address: Address) -> String {
+    let mut id = [0u8; 32];
+    id[0] = kind;
+    id[12..].copy_from_slice(address.as_slice());
+    H256::from(id).to_string()
 }
 
 /// Build synthetic genesis transactions and traces (balance transfers + code deploys).
@@ -944,10 +966,8 @@ pub fn build_genesis_txs_and_traces(
 
     for addr in sorted_addrs {
         let account = &genesis.alloc[addr];
-        let addr_lower = format!("{addr:?}").to_lowercase();
-
         if account.balance > U256::ZERO {
-            let tx_id = format!("0xgenesis01{:013}{}", 0, addr_lower);
+            let tx_id = genesis_tx_id(1, *addr);
             txs.push(DebankTransaction {
                 id: tx_id.clone(),
                 from: zero_addr,
@@ -974,7 +994,7 @@ pub fn build_genesis_txs_and_traces(
         if let Some(ref code) = account.code
             && !code.is_empty()
         {
-            let tx_id = format!("0xgenesis02{:013}{}", 0, addr_lower);
+            let tx_id = genesis_tx_id(2, *addr);
             txs.push(DebankTransaction {
                 id: tx_id.clone(),
                 from: zero_addr,
@@ -1000,9 +1020,8 @@ pub fn build_genesis_txs_and_traces(
     }
 
     // Native token contract (0xeeee...eeee)
-    let native_addr = Address::from_str("0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee").unwrap();
-    let native_addr_lower = format!("{native_addr:?}").to_lowercase();
-    let native_tx_id = format!("0xgenesis03{:013}{}", 0, native_addr_lower);
+    let native_addr = crate::erc20_handle::NATIVE_TOKEN_ADDRESS;
+    let native_tx_id = genesis_tx_id(3, native_addr);
     txs.push(DebankTransaction {
         id: native_tx_id.clone(),
         from: zero_addr,
@@ -1028,8 +1047,99 @@ pub fn build_genesis_txs_and_traces(
 mod tests {
     use super::*;
     use reth_revm::db::{AccountStatus, EmptyDB, InMemoryDB};
-    use revm::state::{AccountInfo, Bytecode};
-    use revm_inspectors::tracing::types::{CallTrace, CallTraceNode};
+    use revm::{
+        interpreter::InstructionResult,
+        state::{AccountInfo, Bytecode},
+    };
+    use revm_inspectors::tracing::types::{CallTrace, CallTraceNode, TraceMemberOrder};
+
+    #[test]
+    fn create_and_create2_use_the_protocol_create_type() {
+        assert_eq!(debank_call_types(CallKind::Create), ("create", ""));
+        assert_eq!(debank_call_types(CallKind::Create2), ("create", ""));
+        assert_eq!(
+            debank_call_types(CallKind::DelegateCall),
+            ("call", "delegatecall")
+        );
+    }
+
+    #[test]
+    fn child_of_failed_parent_has_an_error_message() {
+        let root = Address::repeat_byte(0x11);
+        let child = Address::repeat_byte(0x22);
+        let mut arena = CallTraceArena::default();
+        arena.nodes_mut()[0].trace = CallTrace {
+            address: root,
+            success: false,
+            status: Some(InstructionResult::Revert),
+            ..Default::default()
+        };
+        arena.nodes_mut()[0].children = vec![1];
+        arena.nodes_mut()[0].ordering = vec![TraceMemberOrder::Call(0)];
+        arena.nodes_mut().push(CallTraceNode {
+            parent: Some(0),
+            idx: 1,
+            trace: CallTrace {
+                depth: 1,
+                address: child,
+                success: true,
+                status: Some(InstructionResult::Return),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let (_, error_traces, _, _) = build_debank_traces(
+            H256::repeat_byte(0x33),
+            arena,
+            &[(root, false), (child, false)],
+            &std::cell::RefCell::new(0),
+        );
+        let child_trace = error_traces
+            .iter()
+            .find(|trace| trace.to_addr == child)
+            .unwrap();
+        assert_eq!(child_trace.error, PARENT_CALL_FAILED_ERROR);
+    }
+
+    #[test]
+    fn genesis_synthetic_ids_are_canonical_bytes32() {
+        let balance_addr = Address::from([0x11; 20]);
+        let code_addr = Address::from([0x22; 20]);
+        let genesis = alloy_genesis::Genesis::default().extend_accounts([
+            (
+                balance_addr,
+                alloy_genesis::GenesisAccount::default().with_balance(U256::from(1)),
+            ),
+            (
+                code_addr,
+                alloy_genesis::GenesisAccount::default()
+                    .with_code(Some(Bytes::from_static(&[0x60, 0x00]))),
+            ),
+        ]);
+
+        let (transactions, traces) = build_genesis_txs_and_traces(&genesis);
+        let expected_ids = [
+            "0x0100000000000000000000001111111111111111111111111111111111111111",
+            "0x0200000000000000000000002222222222222222222222222222222222222222",
+            "0x030000000000000000000000eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        ];
+        assert_eq!(
+            transactions
+                .iter()
+                .map(|transaction| transaction.id.as_str())
+                .collect::<Vec<_>>(),
+            expected_ids
+        );
+        assert!(
+            transactions
+                .iter()
+                .all(|transaction| transaction.id.parse::<H256>().is_ok())
+        );
+        for (trace, transaction) in traces.iter().zip(&transactions) {
+            assert_eq!(trace.tx_id, transaction.id);
+        }
+    }
 
     #[test]
     fn receipt_event_uses_raw_log_emitter() {

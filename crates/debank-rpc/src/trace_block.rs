@@ -260,22 +260,42 @@ fn with_event_index(mut event: DebankEvent, next_event_index: &mut usize) -> Deb
 /// Tempo transaction handlers can emit logs both before and after EVM calls. Inspector-only logs
 /// come from reverted frames; receipt-only logs come from handler code outside the interpreter.
 /// Greedily matching equal payloads in order preserves call-trace parents without assuming that
-/// handler logs form a suffix.
+/// handler logs form a suffix. Error events are eligible only for a successful transaction whose
+/// synthetic root was misclassified; otherwise an identical reverted log must not steal a receipt
+/// log from its successful frame.
 fn reconcile_persisted_events(
     events: Vec<DebankEvent>,
     error_events: Vec<DebankEvent>,
     persisted_events: Vec<DebankEvent>,
     root_trace: Option<&DebankTrace>,
+    match_error_events: bool,
     next_event_index: &mut usize,
 ) -> (Vec<DebankEvent>, Vec<DebankEvent>) {
-    let mut candidates = events;
-    candidates.extend(error_events);
-    candidates.sort_by_key(|event| event.idx);
+    struct Candidate {
+        event: DebankEvent,
+        receipt_eligible: bool,
+    }
+
+    let mut candidates = events
+        .into_iter()
+        .map(|event| Candidate {
+            event,
+            receipt_eligible: true,
+        })
+        .chain(error_events.into_iter().map(|event| Candidate {
+            event,
+            receipt_eligible: match_error_events,
+        }))
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|candidate| candidate.event.idx);
 
     let mut candidate_indices: HashMap<EventPayloadKey, VecDeque<usize>> = HashMap::new();
-    for (index, event) in candidates.iter().enumerate() {
+    for (index, candidate) in candidates.iter().enumerate() {
+        if !candidate.receipt_eligible {
+            continue;
+        }
         candidate_indices
-            .entry(event.into())
+            .entry((&candidate.event).into())
             .or_default()
             .push_back(index);
     }
@@ -302,7 +322,7 @@ fn reconcile_persisted_events(
     let mut next_root_position = root_trace.map(|trace| trace.subtraces).unwrap_or_default()
         + candidates
             .iter()
-            .filter(|event| event.parent_trace_id == root_trace_id)
+            .filter(|candidate| candidate.event.parent_trace_id == root_trace_id)
             .count();
     let mut reconciled_events = Vec::with_capacity(persisted_events.len());
     let mut reconciled_error_events = Vec::new();
@@ -320,15 +340,13 @@ fn reconcile_persisted_events(
             event.id = event.debank_id();
             reconciled_events.push(with_event_index(event, next_event_index));
         }
-        for event in candidates[candidate_cursor..candidate_index]
-            .iter()
-            .cloned()
-        {
+        for candidate in &candidates[candidate_cursor..candidate_index] {
+            let event = candidate.event.clone();
             reconciled_error_events.push(with_event_index(event, next_event_index));
         }
 
         reconciled_events.push(with_event_index(
-            candidates[candidate_index].clone(),
+            candidates[candidate_index].event.clone(),
             next_event_index,
         ));
         receipt_cursor = receipt_index + 1;
@@ -336,7 +354,8 @@ fn reconcile_persisted_events(
     }
 
     // Inspector-only trailing logs execute before handler-generated receipt suffix logs.
-    for event in candidates[candidate_cursor..].iter().cloned() {
+    for candidate in &candidates[candidate_cursor..] {
+        let event = candidate.event.clone();
         reconciled_error_events.push(with_event_index(event, next_event_index));
     }
     for mut event in persisted_events[receipt_cursor..].iter().cloned() {
@@ -689,11 +708,14 @@ where
                         .iter()
                         .chain(&error_traces)
                         .find(|trace| trace.trace_address.is_empty());
+                    let match_error_events = replay_tx_statuses[idx]
+                        && root_trace_misclassified(&error_traces);
                     let (events, error_events) = reconcile_persisted_events(
                         events,
                         error_events,
                         persisted_events,
                         root_trace,
+                        match_error_events,
                         &mut next_event_index,
                     );
 
@@ -1028,6 +1050,7 @@ mod tests {
             vec![reverted],
             persisted,
             Some(&root),
+            false,
             &mut next_event_index,
         );
 
@@ -1050,5 +1073,45 @@ mod tests {
         assert_eq!(events[1].parent_trace_id, "child");
         assert_eq!(events[3].parent_trace_id, "root");
         assert_eq!(events[3].pos_in_parent_trace, 3);
+    }
+
+    #[test]
+    fn receipt_reconciliation_does_not_match_a_reverted_duplicate() {
+        let root = DebankTrace {
+            id: "root".to_string(),
+            ..Default::default()
+        };
+        let reverted = DebankEvent {
+            contract_id: Address::repeat_byte(0xaa),
+            selector: "0x01".to_string(),
+            parent_trace_id: "reverted-child".to_string(),
+            idx: 0,
+            ..Default::default()
+        };
+        let successful = DebankEvent {
+            parent_trace_id: "successful-child".to_string(),
+            idx: 1,
+            ..reverted.clone()
+        };
+        let persisted = DebankEvent {
+            parent_trace_id: String::new(),
+            idx: 0,
+            ..reverted.clone()
+        };
+        let mut next_event_index = 0;
+
+        let (events, error_events) = reconcile_persisted_events(
+            vec![successful],
+            vec![reverted],
+            vec![persisted],
+            Some(&root),
+            false,
+            &mut next_event_index,
+        );
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].parent_trace_id, "successful-child");
+        assert_eq!(error_events.len(), 1);
+        assert_eq!(error_events[0].parent_trace_id, "reverted-child");
     }
 }
