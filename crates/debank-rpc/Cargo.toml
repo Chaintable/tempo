@@ -28,6 +28,7 @@ alloy-sol-types = { workspace = true }
 # Reth
 reth-chainspec = { workspace = true }
 reth-evm = { workspace = true }
+reth-errors = { workspace = true }
 reth-primitives-traits = { workspace = true }
 reth-provider = { workspace = true }
 reth-revm = { workspace = true }
@@ -37,6 +38,10 @@ reth-rpc-eth-types = { workspace = true }
 # Revm
 revm = { workspace = true }
 revm-inspectors = { workspace = true }
+
+# Tempo
+tempo-evm = { workspace = true, features = ["rpc"] }
+tempo-revm = { workspace = true }
 
 # Serde
 serde = { workspace = true }

@@ -4013,7 +4013,7 @@ dependencies = [
 
 [[package]]
 name = "debank-rpc"
-version = "1.13.0"
+version = "1.13.2"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -4029,6 +4029,7 @@ dependencies = [
  "jsonrpsee",
  "md-5",
  "reth-chainspec",
+ "reth-errors",
  "reth-evm",
  "reth-primitives-traits",
  "reth-provider",
@@ -4041,6 +4042,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sha1",
+ "tempo-evm",
+ "tempo-revm",
 ]
 
 [[package]]

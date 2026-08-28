@@ -337,7 +337,8 @@ where
                     .merge_if_module_configured(RethRpcModule::Eth, debank_eth_ext.into_rpc())?;
 
                 let debank_trace = DebankTraceBlock::new(eth_api);
-                modules.merge_configured(debank_trace.into_rpc())?;
+                modules
+                    .merge_if_module_configured(RethRpcModule::Trace, debank_trace.into_rpc())?;
 
                 Ok(())
             })

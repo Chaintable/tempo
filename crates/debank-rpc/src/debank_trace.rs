@@ -8,7 +8,7 @@ use alloy_primitives::{
 };
 use alloy_rlp::{RlpDecodable, RlpEncodable};
 use alloy_rpc_types_eth::Header;
-use reth_revm::db::{AccountState, Cache};
+use reth_revm::db::BundleState;
 use revm::DatabaseRef;
 use revm_inspectors::tracing::{
     CallTraceArena,
@@ -415,6 +415,7 @@ fn build_trace_node(
     pos_in_parent_trace: usize,
     node: &CallTraceNode,
     nodes: &[CallTraceNode],
+    native_storage_changes: &[(Address, bool)],
     parent_success: bool,
     trace_address: Vec<usize>,
     log_index: &mut usize,
@@ -424,6 +425,13 @@ fn build_trace_node(
         children: Vec::new(),
         success: node.trace.success && parent_success,
     };
+    if native_storage_changes
+        .get(node.idx)
+        .is_some_and(|(address, changed)| *changed && *address == node.trace.address)
+    {
+        debank_node.trace.self_storage_change = true;
+        debank_node.trace.storage_change = true;
+    }
     debank_node.trace.trace_address = trace_address.clone();
     debank_node.trace.parent_trace_id = parent_trace_id;
     debank_node.trace.pos_in_parent_trace = pos_in_parent_trace;
@@ -447,6 +455,7 @@ fn build_trace_node(
                     debank_node.children.len(),
                     child_node,
                     nodes,
+                    native_storage_changes,
                     parent_success && debank_node.success,
                     ta,
                     log_index,
@@ -553,6 +562,7 @@ fn finish_build_traces(
 pub fn build_debank_traces(
     tx_id: H256,
     traces: CallTraceArena,
+    native_storage_changes: &[(Address, bool)],
     log_index: &std::cell::RefCell<usize>,
 ) -> (
     Vec<DebankTrace>,
@@ -564,12 +574,20 @@ pub fn build_debank_traces(
     if nodes.is_empty() {
         return (vec![], vec![], vec![], vec![]);
     }
+    debug_assert_eq!(nodes.len(), native_storage_changes.len());
+    debug_assert!(
+        nodes
+            .iter()
+            .zip(native_storage_changes)
+            .all(|(node, (address, _))| node.trace.address == *address)
+    );
     let mut top = build_trace_node(
         tx_id.to_string(),
         String::new(),
         0,
         &nodes[0],
         &nodes,
+        native_storage_changes,
         true,
         vec![],
         &mut log_index.borrow_mut(),
@@ -589,44 +607,59 @@ pub fn build_debank_traces(
 }
 
 // ---------------------------------------------------------------------------
-// State diff extraction from execution cache
+// State diff extraction from post-execution bundle
 // ---------------------------------------------------------------------------
 
-pub fn get_storage_contracts_from_cache(cache: &Cache) -> Vec<Address> {
-    cache
-        .accounts
+pub fn get_storage_contracts_from_bundle(bundle: &BundleState) -> Vec<Address> {
+    bundle
+        .state
         .iter()
         .filter(|(_, account)| !account.storage.is_empty())
         .map(|(address, _)| *address)
         .collect()
 }
 
-pub fn get_storage_diffs_from_cache<DB: DatabaseRef>(cache: Cache, pre_db: DB) -> BlockStorageDiff {
+pub fn get_storage_diffs_from_bundle<DB: DatabaseRef>(
+    bundle: BundleState,
+    pre_db: &DB,
+) -> BlockStorageDiff {
     let mut new_accounts = Vec::new();
     let mut deleted_accounts = Vec::new();
     let mut storage_diffs = Vec::new();
     let mut new_codes = Vec::new();
+    let mut seen_new_code_hashes = std::collections::HashSet::new();
 
-    for (address, db_account) in cache.accounts {
-        if db_account.account_state == AccountState::NotExisting {
+    for (address, account) in bundle.state {
+        let was_destroyed = account.was_destroyed();
+        if was_destroyed {
+            // Leafage applies deletions before new account/storage values. A contract destroyed and
+            // recreated in the same block therefore needs both records so stale parent storage is
+            // cleared before the recreated state is installed.
             deleted_accounts.push(keccak256(address.0));
-            continue;
         }
+
+        let Some(info) = account.info else {
+            if !was_destroyed {
+                deleted_accounts.push(keccak256(address.0));
+            }
+            continue;
+        };
 
         new_accounts.push(NewAccount {
             address: keccak256(address.0),
-            balance: db_account.info.balance,
-            nonce: db_account.info.nonce,
-            code_hash: db_account.info.code_hash,
+            balance: info.balance,
+            nonce: info.nonce,
+            code_hash: info.code_hash,
         });
 
-        if !db_account.storage.is_empty() {
-            let diffs: Vec<IndexValuePair> = db_account
+        if !account.storage.is_empty() {
+            let diffs: Vec<IndexValuePair> = account
                 .storage
                 .into_iter()
-                .map(|(key, value)| IndexValuePair {
+                .filter(|(_, slot)| slot.present_value != slot.previous_or_original_value)
+                .map(|(key, slot)| IndexValuePair {
                     index: keccak256::<[u8; 32]>(key.to_be_bytes()),
-                    value,
+                    value: slot.present_value,
                 })
                 .collect();
             if !diffs.is_empty() {
@@ -637,11 +670,14 @@ pub fn get_storage_diffs_from_cache<DB: DatabaseRef>(cache: Cache, pre_db: DB) -
             }
         }
 
-        if let Some(code) = db_account.info.code {
-            let code_hash = db_account.info.code_hash;
+        if let Some(code) = info.code {
+            let code_hash = info.code_hash;
             if let Ok(Some(account)) = pre_db.basic_ref(address)
                 && account.code_hash == code_hash
             {
+                continue;
+            }
+            if !seen_new_code_hashes.insert(code_hash) {
                 continue;
             }
             new_codes.push(NewCode {
@@ -828,6 +864,151 @@ pub fn build_genesis_txs_and_traces(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reth_revm::db::{AccountStatus, EmptyDB, InMemoryDB};
+    use revm::state::{AccountInfo, Bytecode};
+    use revm_inspectors::tracing::types::{CallTrace, CallTraceNode};
+
+    #[test]
+    fn bundle_state_diff_filters_restored_slots_and_deduplicates_code() {
+        let changed = Address::repeat_byte(0x11);
+        let clone = Address::repeat_byte(0x22);
+        let deleted = Address::repeat_byte(0x33);
+        let recreated = Address::repeat_byte(0x44);
+        let changed_slot = U256::from(1);
+        let restored_slot = U256::from(2);
+        let code = Bytes::from(vec![0x60, 0x00, 0x56]);
+        let code_hash = keccak256(&code);
+        let code = Bytecode::new_raw(code);
+
+        let original = AccountInfo {
+            balance: U256::from(10),
+            nonce: 1,
+            ..Default::default()
+        };
+        let present = AccountInfo {
+            balance: U256::from(20),
+            nonce: 2,
+            code_hash,
+            code: Some(code.clone()),
+            ..Default::default()
+        };
+        let cloned = AccountInfo {
+            code_hash,
+            code: Some(code.clone()),
+            ..Default::default()
+        };
+
+        let mut bundle = BundleState::new(
+            [
+                (
+                    changed,
+                    Some(original.clone()),
+                    Some(present),
+                    [
+                        (changed_slot, (U256::from(3), U256::from(4))),
+                        (restored_slot, (U256::from(5), U256::from(5))),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+                (clone, None, Some(cloned), Default::default()),
+                (
+                    recreated,
+                    Some(original.clone()),
+                    Some(AccountInfo {
+                        balance: U256::from(30),
+                        nonce: 1,
+                        code_hash,
+                        code: Some(code),
+                        ..Default::default()
+                    }),
+                    Default::default(),
+                ),
+                (deleted, Some(original), None, Default::default()),
+            ],
+            std::iter::empty::<Vec<(Address, Option<Option<AccountInfo>>, Vec<(U256, U256)>)>>(),
+            std::iter::empty::<(H256, Bytecode)>(),
+        );
+        bundle.state.get_mut(&recreated).unwrap().status = AccountStatus::DestroyedChanged;
+
+        assert_eq!(get_storage_contracts_from_bundle(&bundle), vec![changed]);
+
+        let diff = get_storage_diffs_from_bundle(bundle, &InMemoryDB::new(EmptyDB::default()));
+        assert_eq!(diff.new_accounts.len(), 3);
+        assert!(
+            diff.new_accounts
+                .iter()
+                .any(|account| account.address == keccak256(recreated.0))
+        );
+        assert_eq!(diff.deleted_accounts.len(), 2);
+        assert!(diff.deleted_accounts.contains(&keccak256(deleted.0)));
+        assert!(diff.deleted_accounts.contains(&keccak256(recreated.0)));
+        assert_eq!(diff.new_codes.len(), 1);
+        assert_eq!(diff.new_codes[0].code_hash, code_hash);
+
+        let storage = diff
+            .storage_diffs
+            .iter()
+            .find(|account| account.address == keccak256(changed.0))
+            .unwrap();
+        assert_eq!(storage.diffs.len(), 1);
+        assert_eq!(
+            storage.diffs[0],
+            IndexValuePair {
+                index: keccak256::<[u8; 32]>(changed_slot.to_be_bytes()),
+                value: U256::from(4),
+            }
+        );
+    }
+
+    #[test]
+    fn native_precompile_storage_change_marks_frame_and_ancestors() {
+        let root = Address::repeat_byte(0x44);
+        let precompile = Address::repeat_byte(0x55);
+        let mut arena = CallTraceArena::default();
+        arena.nodes_mut()[0] = CallTraceNode {
+            children: vec![1],
+            ordering: vec![TraceMemberOrder::Call(0)],
+            trace: CallTrace {
+                success: true,
+                address: root,
+                kind: CallKind::Call,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        arena.nodes_mut().push(CallTraceNode {
+            parent: Some(0),
+            idx: 1,
+            trace: CallTrace {
+                depth: 1,
+                success: true,
+                address: precompile,
+                kind: CallKind::Call,
+                maybe_precompile: Some(true),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let (traces, error_traces, _, _) = build_debank_traces(
+            H256::repeat_byte(0xaa),
+            arena,
+            &[(root, false), (precompile, true)],
+            &std::cell::RefCell::new(0),
+        );
+
+        assert!(error_traces.is_empty());
+        let root_trace = traces.iter().find(|trace| trace.to_addr == root).unwrap();
+        assert!(!root_trace.self_storage_change);
+        assert!(root_trace.storage_change);
+        let precompile_trace = traces
+            .iter()
+            .find(|trace| trace.to_addr == precompile)
+            .unwrap();
+        assert!(precompile_trace.self_storage_change);
+        assert!(precompile_trace.storage_change);
+    }
 
     #[test]
     fn test_debank_tx_aa_fields_serialization() {

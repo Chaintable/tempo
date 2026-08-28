@@ -3,30 +3,186 @@
 //! Replays all transactions in a block, collecting DeBank-format traces, events,
 //! and state diffs for consumption by background-tracer → S3/Kafka → leafage-evm.
 
-use alloy_consensus::{BlockHeader, Transaction, transaction::TxHashRef};
+use alloy_consensus::{BlockHeader, Transaction, TxReceipt, transaction::TxHashRef};
 use alloy_eips::BlockId;
 use alloy_primitives::{Address, B256, U256};
 use alloy_rpc_types_eth::Header;
 use jsonrpsee::core::RpcResult;
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
-use reth_evm::ConfigureEvm;
+use reth_errors::{BlockExecutionError, RethError};
+use reth_evm::{ConfigureEvm, Evm, block::TxResult, execute::BlockExecutor};
 use reth_primitives_traits::BlockBody;
 use reth_provider::ChainSpecProvider;
 use reth_revm::{State, database::StateProviderDatabase};
 use reth_rpc_eth_api::{
-    EthApiTypes,
+    EthApiTypes, FromEthApiError, RpcNodeCore,
     helpers::{
         EthBlocks, EthTransactions, LoadBlock, LoadReceipt, LoadState, SpawnBlocking, TraceExt,
     },
 };
 use reth_rpc_eth_types::{EthApiError, cache::db::StateProviderTraitObjWrapper};
-use revm::DatabaseCommit;
-use revm::bytecode::opcode::OpCode;
+use revm::{
+    Database, Inspector, JournalEntry,
+    bytecode::opcode::OpCode,
+    context::{ContextTr, JournalTr},
+    database::states::bundle_state::BundleRetention,
+    interpreter::{CallInputs, CallOutcome, CallScheme, CreateInputs, CreateOutcome},
+};
 use revm_inspectors::tracing::{OpcodeFilter, TracingInspector, TracingInspectorConfig};
-use std::str::FromStr;
+use std::{mem, str::FromStr};
+use tempo_evm::TempoEvmConfig;
+use tempo_revm::evm::TempoContext;
 
 use crate::debank_trace::*;
-use crate::state_diff_db::StateDiffTraceDB;
+
+type DebankInspector = (TracingInspector, NativeStorageChangeInspector);
+
+#[derive(Debug)]
+struct NativeCallFrame {
+    change_index: usize,
+    journal_start: usize,
+    is_precompile: bool,
+}
+
+/// Records storage writes performed inside native precompile frames.
+///
+/// Native precompiles write through the journal directly, so they do not execute an SSTORE opcode
+/// that [`TracingInspector`] can attach to a call trace. Call records are kept in the same
+/// insertion order as the tracing arena and merged into the DeBank trace after execution.
+#[derive(Debug, Default)]
+struct NativeStorageChangeInspector {
+    frames: Vec<NativeCallFrame>,
+    changes: Vec<(Address, bool)>,
+}
+
+impl NativeStorageChangeInspector {
+    fn start_frame<DB: Database>(
+        &mut self,
+        context: &TempoContext<DB>,
+        address: Address,
+        is_precompile: bool,
+    ) {
+        let change_index = self.changes.len();
+        self.changes.push((address, false));
+        self.frames.push(NativeCallFrame {
+            change_index,
+            journal_start: context.journaled_state.journal.len(),
+            is_precompile,
+        });
+    }
+
+    fn finish_frame<DB: Database>(&mut self, context: &TempoContext<DB>) {
+        let Some(frame) = self.frames.pop() else {
+            return;
+        };
+        if !frame.is_precompile {
+            return;
+        }
+
+        let storage_changed = context
+            .journaled_state
+            .journal
+            .get(frame.journal_start..)
+            .is_some_and(|entries| {
+                entries
+                    .iter()
+                    .any(|entry| matches!(entry, JournalEntry::StorageChanged { .. }))
+            });
+        self.changes[frame.change_index].1 = storage_changed;
+    }
+
+    fn into_changes(self) -> Vec<(Address, bool)> {
+        self.changes
+    }
+}
+
+impl<DB: Database> Inspector<TempoContext<DB>> for NativeStorageChangeInspector {
+    fn call(
+        &mut self,
+        context: &mut TempoContext<DB>,
+        inputs: &mut CallInputs,
+    ) -> Option<CallOutcome> {
+        let address = match inputs.scheme {
+            CallScheme::DelegateCall | CallScheme::CallCode => inputs.bytecode_address,
+            _ => inputs.target_address,
+        };
+        let is_precompile = context
+            .journal_ref()
+            .precompile_addresses()
+            .contains(&address);
+        self.start_frame(context, address, is_precompile);
+        None
+    }
+
+    fn call_end(
+        &mut self,
+        context: &mut TempoContext<DB>,
+        _inputs: &CallInputs,
+        _outcome: &mut CallOutcome,
+    ) {
+        self.finish_frame(context);
+    }
+
+    fn create(
+        &mut self,
+        context: &mut TempoContext<DB>,
+        inputs: &mut CreateInputs,
+    ) -> Option<CreateOutcome> {
+        // TracingInspector runs first in the inspector tuple and has already loaded the caller.
+        // Repeat the lookup to derive the same address and preserve one-to-one arena ordering.
+        let nonce = context
+            .journal_mut()
+            .load_account(inputs.caller())
+            .ok()?
+            .info
+            .nonce;
+        self.start_frame(context, inputs.created_address(nonce), false);
+        None
+    }
+
+    fn create_end(
+        &mut self,
+        context: &mut TempoContext<DB>,
+        _inputs: &CreateInputs,
+        _outcome: &mut CreateOutcome,
+    ) {
+        self.finish_frame(context);
+    }
+}
+
+fn new_debank_inspector() -> DebankInspector {
+    let mut trace_cfg = TracingInspectorConfig::default_parity()
+        .set_steps(true)
+        .set_record_logs(true)
+        .set_exclude_precompile_calls(false);
+    trace_cfg.record_opcodes_filter = Some(OpcodeFilter::new().enabled(OpCode::SSTORE));
+    (
+        TracingInspector::new(trace_cfg),
+        NativeStorageChangeInspector::default(),
+    )
+}
+
+fn root_trace_misclassified(error_traces: &[DebankTrace]) -> bool {
+    error_traces
+        .iter()
+        .any(|trace| trace.trace_address.is_empty())
+}
+
+fn successful_receipt_event_count(
+    error_traces: &[DebankTrace],
+    events: &[DebankEvent],
+    error_events: &[DebankEvent],
+) -> usize {
+    if root_trace_misclassified(error_traces) {
+        // Tempo AA execution can mark the whole arena as failed even when the receipt succeeds.
+        // In that case all inspector events are persisted receipt events.
+        events.len() + error_events.len()
+    } else {
+        // Logs emitted by a reverted internal call are inspector-visible but absent from the
+        // receipt, so they must not hide handler-injected fee logs at the end of exec_logs.
+        events.len()
+    }
+}
 
 /// `trace` namespace API implementation for `debankBlock`.
 #[derive(Clone)]
@@ -43,6 +199,7 @@ impl<Eth> DebankTraceBlock<Eth> {
 impl<Eth> DebankTraceBlock<Eth>
 where
     Eth: EthApiTypes
+        + RpcNodeCore<Evm = TempoEvmConfig, Primitives = <TempoEvmConfig as ConfigureEvm>::Primitives>
         + EthBlocks
         + LoadBlock
         + LoadReceipt
@@ -136,7 +293,15 @@ where
             return Err(EthApiError::HeaderNotFound(block_id).into());
         };
 
-        let block_txs = block.body().transactions();
+        let block_txs = BlockBody::transactions(block.body());
+        if receipts.len() != block_txs.len() {
+            return Err(Eth::Error::from_eth_err(BlockExecutionError::msg(format!(
+                "trace_debankBlock receipt count mismatch for block {}: receipts {}, transactions {}",
+                block.number(),
+                receipts.len(),
+                block_txs.len(),
+            ))));
+        }
         let mut debank_txs: Vec<DebankTransaction> = Vec::with_capacity(block_txs.len());
 
         for index in 0..block_txs.len() {
@@ -292,22 +457,33 @@ where
         let (traces_result, state_diff, change_addresses) = self
             .eth_api
             .spawn_blocking_io_fut(move |eth_api| async move {
-                // Two independent state providers from the same parent block:
-                // pre_db for diff comparison, db for tx execution
-                let state1 = eth_api.state_at_block_id(parent_block_id).await?;
-                let state2 = eth_api.state_at_block_id(parent_block_id).await?;
+                let parent_state = eth_api.state_at_block_id(parent_block_id).await?;
+                let mut replay_state = State::builder()
+                    .with_database(StateProviderDatabase::new(StateProviderTraitObjWrapper(
+                        parent_state,
+                    )))
+                    .with_bundle_update()
+                    .build();
 
-                let pre_db = State::builder()
-                    .with_database(StateProviderDatabase::new(StateProviderTraitObjWrapper(
-                        state1,
-                    )))
-                    .build();
-                let cache_db = State::builder()
-                    .with_database(StateProviderDatabase::new(StateProviderTraitObjWrapper(
-                        state2,
-                    )))
-                    .build();
-                let mut diff_db = StateDiffTraceDB::new(cache_db);
+                let evm = eth_api.evm_config().evm_with_env_and_inspector(
+                    &mut replay_state,
+                    evm_env,
+                    new_debank_inspector(),
+                );
+                let execution_ctx = eth_api
+                    .evm_config()
+                    .context_for_block(block.sealed_block())
+                    .map_err(RethError::other)
+                    .map_err(Eth::Error::from_eth_err)?;
+                let mut executor = eth_api.evm_config().create_executor(evm, execution_ctx);
+                executor
+                    .apply_pre_execution_changes()
+                    .map_err(Eth::Error::from_eth_err)?;
+
+                // Pre-execution system calls are block-level state changes, not transaction
+                // traces. Discard anything recorded while applying them and start each
+                // transaction with a fresh inspector.
+                *executor.evm_mut().components_mut().1 = new_debank_inspector();
 
                 let log_index = std::cell::RefCell::new(0usize);
                 // (traces, error_traces, events, error_events, receipt_log_count)
@@ -323,27 +499,26 @@ where
                 for (idx, tx) in block.transactions_recovered().enumerate() {
                     let tx_hash = tx_hashes[idx];
 
-                    let mut trace_cfg = TracingInspectorConfig::default_parity()
-                        .set_steps(true)
-                        .set_record_logs(true)
-                        .set_exclude_precompile_calls(true);
-                    trace_cfg.record_opcodes_filter =
-                        Some(OpcodeFilter::new().enabled(OpCode::SSTORE));
-                    let mut inspector = TracingInspector::new(trace_cfg);
+                    let output = executor
+                        .execute_transaction_without_commit(tx)
+                        .map_err(Eth::Error::from_eth_err)?;
+                    let exec_logs = output.result().result.logs().to_vec();
 
-                    let tx_env = eth_api.evm_config().tx_env(tx);
-
-                    let revm::context::result::ResultAndState {
-                        result: exec_result,
-                        state,
-                    } = eth_api.inspect(&mut diff_db, evm_env.clone(), tx_env, &mut inspector)?;
-                    diff_db.commit(state);
-
-                    let exec_logs = exec_result.into_logs();
-
+                    let (inspector, native_storage_inspector) = mem::replace(
+                        executor.evm_mut().components_mut().1,
+                        new_debank_inspector(),
+                    );
                     let arena = inspector.into_traces();
+                    let native_storage_changes = native_storage_inspector.into_changes();
                     let (traces, error_traces, events, error_events) =
-                        build_debank_traces(tx_hash, arena, &log_index);
+                        build_debank_traces(
+                            tx_hash,
+                            arena,
+                            &native_storage_changes,
+                            &log_index,
+                        );
+
+                    executor.commit_transaction(output);
 
                     // Append fee logs not captured by the inspector.
                     //
@@ -357,8 +532,12 @@ where
                     // directly — do NOT compare with evm_event_count, because the
                     // inspector may have captured N error_events from pre-revert emits,
                     // and receipt_log_count (fee only) < N would cause fee log loss.
-                    let evm_event_count = events.len() + error_events.len();
                     let tx_reverted = !tx_statuses_clone.get(idx).copied().unwrap_or(true);
+                    let persisted_evm_event_count = successful_receipt_event_count(
+                        &error_traces,
+                        &events,
+                        &error_events,
+                    );
                     let receipt_logs = receipt_logs_per_tx.get(idx).cloned().unwrap_or_default();
 
                     all_results.push((
@@ -388,9 +567,9 @@ where
                                 }
                             })
                             .collect()
-                    } else if exec_logs.len() > evm_event_count {
+                    } else if exec_logs.len() > persisted_evm_event_count {
                         // Success path: use exec_logs beyond inspector-captured events
-                        exec_logs[evm_event_count..]
+                        exec_logs[persisted_evm_event_count..]
                             .iter()
                             .map(|log| {
                                 let selector = log
@@ -441,20 +620,64 @@ where
                             .chain(last.3.iter())
                             .filter(|e| e.parent_trace_id == root_trace_id)
                             .count();
-                        let mut fee_pos = root_subtraces + existing_events_on_root;
+                        let fee_pos = root_subtraces + existing_events_on_root;
 
-                        for mut fee_event in extra_log_source {
+                        for (offset, mut fee_event) in extra_log_source.into_iter().enumerate() {
                             fee_event.parent_trace_id = root_trace_id.clone();
-                            fee_event.pos_in_parent_trace = fee_pos;
+                            fee_event.pos_in_parent_trace = fee_pos + offset;
                             fee_event.id = fee_event.debank_id();
                             all_results.last_mut().unwrap().2.push(fee_event);
-                            fee_pos += 1;
                         }
                     }
                 }
 
-                let change_addresses = get_storage_contracts_from_cache(&diff_db.diff.cache);
-                let state_diff = get_storage_diffs_from_cache(diff_db.diff.cache, pre_db);
+                let (evm, execution_result) = executor
+                    .finish()
+                    .map_err(Eth::Error::from_eth_err)?;
+                drop(evm);
+
+                if execution_result.gas_used != block.gas_used() {
+                    return Err(Eth::Error::from_eth_err(BlockExecutionError::msg(format!(
+                        "trace_debankBlock gas mismatch for block {}: replayed {}, header {}",
+                        block.number(),
+                        execution_result.gas_used,
+                        block.gas_used(),
+                    ))));
+                }
+
+                let receipts_with_bloom = execution_result
+                    .receipts
+                    .iter()
+                    .map(|receipt| receipt.with_bloom_ref())
+                    .collect::<Vec<_>>();
+                let replayed_receipts_root =
+                    alloy_consensus::proofs::calculate_receipt_root(&receipts_with_bloom);
+                if replayed_receipts_root != block.receipts_root() {
+                    return Err(Eth::Error::from_eth_err(BlockExecutionError::msg(format!(
+                        "trace_debankBlock receipts root mismatch for block {}: replayed {}, header {}",
+                        block.number(),
+                        replayed_receipts_root,
+                        block.receipts_root(),
+                    ))));
+                }
+
+                replay_state.merge_transitions(BundleRetention::PlainState);
+                let bundle_state = replay_state.take_bundle();
+                let parent_state_provider = &replay_state.database.0.0;
+                let hashed_state = parent_state_provider.hashed_post_state(&bundle_state);
+                let replayed_state_root = parent_state_provider
+                    .state_root(hashed_state)
+                    .map_err(Eth::Error::from_eth_err)?;
+                if replayed_state_root != block_state_root {
+                    return Err(Eth::Error::from_eth_err(BlockExecutionError::msg(format!(
+                        "trace_debankBlock state root mismatch for block {}: replayed {}, header {}",
+                        block.number(), replayed_state_root, block_state_root,
+                    ))));
+                }
+
+                let change_addresses = get_storage_contracts_from_bundle(&bundle_state);
+                let state_diff =
+                    get_storage_diffs_from_bundle(bundle_state, &replay_state.database);
                 Ok((all_results, state_diff, change_addresses))
             })
             .await?;
@@ -479,7 +702,7 @@ where
         {
             let tx_success = tx_statuses.get(idx).copied().unwrap_or(true);
             if tx_success {
-                let root_misclassified = error_trace.iter().any(|t| t.trace_address.is_empty());
+                let root_misclassified = root_trace_misclassified(&error_trace);
                 if root_misclassified {
                     // AA tx: arena success flags unreliable, merge all
                     trace.extend(error_trace);
@@ -550,6 +773,7 @@ where
 impl<Eth> crate::DebankTraceApiServer for DebankTraceBlock<Eth>
 where
     Eth: EthApiTypes
+        + RpcNodeCore<Evm = TempoEvmConfig, Primitives = <TempoEvmConfig as ConfigureEvm>::Primitives>
         + EthBlocks
         + EthTransactions
         + LoadBlock
@@ -561,6 +785,12 @@ where
     Eth::Provider: ChainSpecProvider<ChainSpec: EthChainSpec + EthereumHardforks>,
 {
     async fn trace_debank_block(&self, block_id: BlockId) -> RpcResult<DebankOutPut> {
+        let _permit = self
+            .eth_api
+            .acquire_owned_tracing()
+            .await
+            .map_err(RethError::other)
+            .map_err(EthApiError::Internal)?;
         Self::trace_debank_block(self, block_id)
             .await
             .map_err(Into::into)
@@ -570,5 +800,70 @@ where
 impl<Eth> std::fmt::Debug for DebankTraceBlock<Eth> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DebankTraceBlock").finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reth_revm::MainContext;
+    use revm::{
+        Context,
+        database::{CacheDB, EmptyDB},
+    };
+    use tempo_evm::TempoBlockEnv;
+    use tempo_revm::TempoTxEnv;
+
+    #[test]
+    fn native_inspector_attributes_journaled_storage_to_precompile_frame() {
+        let root = Address::repeat_byte(0x11);
+        let precompile = Address::repeat_byte(0x22);
+        let mut context: TempoContext<_> = Context::mainnet()
+            .with_db(CacheDB::new(EmptyDB::default()))
+            .with_block(TempoBlockEnv::default())
+            .with_cfg(Default::default())
+            .with_tx(TempoTxEnv::default());
+        let mut inspector = NativeStorageChangeInspector::default();
+
+        inspector.start_frame(&context, root, false);
+        inspector.start_frame(&context, precompile, true);
+        context.journal_mut().load_account(precompile).unwrap();
+        context
+            .journal_mut()
+            .sstore(precompile, U256::ZERO, U256::from(1))
+            .unwrap();
+        inspector.finish_frame(&context);
+        inspector.finish_frame(&context);
+
+        assert_eq!(
+            inspector.into_changes(),
+            vec![(root, false), (precompile, true)]
+        );
+    }
+
+    #[test]
+    fn reverted_internal_events_do_not_hide_fee_logs() {
+        let internal_error_trace = DebankTrace {
+            trace_address: vec![0],
+            ..Default::default()
+        };
+        assert_eq!(
+            successful_receipt_event_count(
+                &[internal_error_trace],
+                &[DebankEvent::default()],
+                &[DebankEvent::default()],
+            ),
+            1
+        );
+
+        let misclassified_root = DebankTrace::default();
+        assert_eq!(
+            successful_receipt_event_count(
+                &[misclassified_root],
+                &[DebankEvent::default()],
+                &[DebankEvent::default()],
+            ),
+            2
+        );
     }
 }
