@@ -21,7 +21,10 @@ use std::{
     rc::Rc,
 };
 use tempo_chainspec::hardfork::TempoHardfork;
-use tempo_precompiles::{storage::StorageAction, storage_credits::NonCreditableSlots};
+use tempo_precompiles::{
+    storage::{StorageAction, StorageActions},
+    storage_credits::NonCreditableSlots,
+};
 use tempo_revm::{
     ProtocolFeeManager, TempoHaltReason, TempoInvalidTransaction, TempoTxEnv, ValidationContext,
     evm::TempoContext, handler::TempoEvmHandler,
@@ -174,6 +177,11 @@ impl<DB: Database, I> TempoEvm<DB, I> {
         actions.enable();
         self.inner = self.inner.with_actions(actions);
         self
+    }
+
+    /// Returns a shared handle to the storage action buffer.
+    pub fn storage_actions(&self) -> StorageActions {
+        self.inner.actions().clone()
     }
 
     /// Replaces the recorded storage actions with an empty buffer, returning the previous actions.

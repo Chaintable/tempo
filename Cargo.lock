@@ -4045,6 +4045,7 @@ dependencies = [
  "serde_json",
  "sha1",
  "tempo-evm",
+ "tempo-precompiles",
  "tempo-revm",
 ]
 

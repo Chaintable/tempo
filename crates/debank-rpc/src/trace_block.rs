@@ -38,6 +38,7 @@ use std::{
     str::FromStr,
 };
 use tempo_evm::TempoEvmConfig;
+use tempo_precompiles::storage::StorageActions;
 use tempo_revm::evm::TempoContext;
 
 use crate::debank_trace::*;
@@ -48,6 +49,7 @@ type DebankInspector = (TracingInspector, NativeStorageChangeInspector);
 struct NativeCallFrame {
     change_index: usize,
     journal_start: usize,
+    action_cursor: usize,
     is_precompile: bool,
 }
 
@@ -56,13 +58,28 @@ struct NativeCallFrame {
 /// Native precompiles write through the journal directly, so they do not execute an SSTORE opcode
 /// that [`TracingInspector`] can attach to a call trace. Call records are kept in the same
 /// insertion order as real tracing arena nodes and merged into the DeBank trace after execution.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct NativeStorageChangeInspector {
     frames: Vec<NativeCallFrame>,
     changes: Vec<(Address, bool)>,
+    actions: StorageActions,
+}
+
+impl Default for NativeStorageChangeInspector {
+    fn default() -> Self {
+        Self::new(StorageActions::disabled())
+    }
 }
 
 impl NativeStorageChangeInspector {
+    fn new(actions: StorageActions) -> Self {
+        Self {
+            frames: Vec::new(),
+            changes: Vec::new(),
+            actions,
+        }
+    }
+
     fn start_frame<DB: Database>(
         &mut self,
         context: &TempoContext<DB>,
@@ -74,6 +91,7 @@ impl NativeStorageChangeInspector {
         self.frames.push(NativeCallFrame {
             change_index,
             journal_start: context.journaled_state.journal.len(),
+            action_cursor: self.actions.cursor(),
             is_precompile,
         });
     }
@@ -86,7 +104,7 @@ impl NativeStorageChangeInspector {
             return;
         }
 
-        let storage_changed = context
+        let journal_storage_changed = context
             .journaled_state
             .journal
             .get(frame.journal_start..)
@@ -95,7 +113,8 @@ impl NativeStorageChangeInspector {
                     .iter()
                     .any(|entry| matches!(entry, JournalEntry::StorageChanged { .. }))
             });
-        self.changes[frame.change_index].1 = storage_changed;
+        self.changes[frame.change_index].1 =
+            journal_storage_changed || self.actions.has_storage_write_since(frame.action_cursor);
     }
 
     fn into_changes(self) -> Vec<(Address, bool)> {
@@ -157,7 +176,7 @@ impl<DB: Database> Inspector<TempoContext<DB>> for NativeStorageChangeInspector 
     }
 }
 
-fn new_debank_inspector() -> DebankInspector {
+fn new_debank_inspector(actions: StorageActions) -> DebankInspector {
     let mut trace_cfg = TracingInspectorConfig::default_parity()
         .set_steps(true)
         .set_record_logs(true)
@@ -165,7 +184,7 @@ fn new_debank_inspector() -> DebankInspector {
     trace_cfg.record_opcodes_filter = Some(OpcodeFilter::new().enabled(OpCode::SSTORE));
     (
         TracingInspector::new(trace_cfg),
-        NativeStorageChangeInspector::default(),
+        NativeStorageChangeInspector::new(actions),
     )
 }
 
@@ -625,11 +644,12 @@ where
                     .with_bundle_update()
                     .build();
 
-                let evm = eth_api.evm_config().evm_with_env_and_inspector(
-                    &mut replay_state,
-                    evm_env,
-                    new_debank_inspector(),
-                );
+                let evm = eth_api
+                    .evm_config()
+                    .evm_with_env(&mut replay_state, evm_env)
+                    .with_actions();
+                let storage_actions = evm.storage_actions();
+                let evm = evm.with_inspector(new_debank_inspector(storage_actions));
                 let execution_ctx = eth_api
                     .evm_config()
                     .context_for_block(block.sealed_block())
@@ -643,7 +663,10 @@ where
                 // Pre-execution system calls are block-level state changes, not transaction
                 // traces. Discard anything recorded while applying them and start each
                 // transaction with a fresh inspector.
-                *executor.evm_mut().components_mut().1 = new_debank_inspector();
+                executor.evm_mut().clear_actions();
+                let storage_actions = executor.evm_mut().storage_actions();
+                *executor.evm_mut().components_mut().1 =
+                    new_debank_inspector(storage_actions);
 
                 let mut next_event_index = 0usize;
                 // (traces, error_traces, events, error_events)
@@ -662,10 +685,10 @@ where
                         .execute_transaction_without_commit(tx)
                         .map_err(Eth::Error::from_eth_err)?;
 
-                    let (mut inspector, native_storage_inspector) = mem::replace(
-                        executor.evm_mut().components_mut().1,
-                        new_debank_inspector(),
-                    );
+                    let storage_actions = executor.evm_mut().storage_actions();
+                    let next_inspector = new_debank_inspector(storage_actions);
+                    let (mut inspector, native_storage_inspector) =
+                        mem::replace(executor.evm_mut().components_mut().1, next_inspector);
                     inspector.set_transaction_gas_limit(tx.gas_limit());
                     inspector.set_transaction_gas_used(tx_gas_used[idx]);
                     inspector.set_transaction_caller(Address::from(*tx.signer()));
@@ -692,6 +715,7 @@ where
                         );
 
                     executor.commit_transaction(output);
+                    executor.evm_mut().clear_actions();
                     let persisted_events = executor
                         .receipts()
                         .get(idx)
@@ -945,6 +969,7 @@ mod tests {
     };
     use revm_inspectors::tracing::types::{CallTrace, CallTraceNode, TraceMemberOrder};
     use tempo_evm::TempoBlockEnv;
+    use tempo_precompiles::storage::StorageAction;
     use tempo_revm::TempoTxEnv;
 
     #[test]
@@ -972,6 +997,31 @@ mod tests {
             inspector.into_changes(),
             vec![(root, false), (precompile, true)]
         );
+    }
+
+    #[test]
+    fn native_inspector_retains_storage_actions_after_journal_revert() {
+        let precompile = Address::repeat_byte(0x22);
+        let actions = StorageActions::enabled();
+        let context: TempoContext<_> = Context::mainnet()
+            .with_db(CacheDB::new(EmptyDB::default()))
+            .with_block(TempoBlockEnv::default())
+            .with_cfg(Default::default())
+            .with_tx(TempoTxEnv::default());
+        let mut inspector = NativeStorageChangeInspector::new(actions.clone());
+
+        inspector.start_frame(&context, precompile, true);
+        actions.record(StorageAction::Sstore(
+            precompile,
+            U256::ZERO,
+            U256::ZERO,
+            U256::ONE,
+        ));
+        // A failed precompile has already reverted its journal checkpoint before call_end.
+        assert!(context.journaled_state.journal.is_empty());
+        inspector.finish_frame(&context);
+
+        assert_eq!(inspector.into_changes(), vec![(precompile, true)]);
     }
 
     #[test]

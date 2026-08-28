@@ -43,6 +43,7 @@ revm-inspectors = { workspace = true }
 
 # Tempo
 tempo-evm = { workspace = true, features = ["rpc"] }
+tempo-precompiles.workspace = true
 tempo-revm = { workspace = true }
 
 # Serde
