@@ -4,7 +4,7 @@
 
 use alloy_consensus::constants::KECCAK_EMPTY;
 use alloy_primitives::{
-    Address, B256 as H256, BlockHash, BlockNumber, Bytes, U256, hex, keccak256,
+    Address, B256 as H256, BlockHash, BlockNumber, Bytes, Log, U256, hex, keccak256,
 };
 use alloy_rlp::{RlpDecodable, RlpEncodable};
 use alloy_rpc_types_eth::Header;
@@ -373,18 +373,40 @@ impl From<&CallLog> for DebankEvent {
             .first()
             .map(|h| h.to_string())
             .unwrap_or_default();
-        let topics = if log.raw_log.topics().len() > 1 {
-            log.raw_log.topics()[1..]
-                .iter()
-                .map(|h| h.to_string())
-                .collect()
+        let topics = log
+            .raw_log
+            .topics()
+            .iter()
+            .skip(1)
+            .map(|h| h.to_string())
+            .collect();
+        Self {
+            contract_id: log.address,
+            selector,
+            topics,
+            data: log.raw_log.data.clone(),
+            ..Default::default()
+        }
+    }
+}
+
+impl From<&Log> for DebankEvent {
+    fn from(log: &Log) -> Self {
+        let selector = log
+            .topics()
+            .first()
+            .map(|h| h.to_string())
+            .unwrap_or_default();
+        let topics = if log.topics().len() > 1 {
+            log.topics()[1..].iter().map(|h| h.to_string()).collect()
         } else {
             vec![]
         };
         Self {
+            contract_id: log.address,
             selector,
             topics,
-            data: log.raw_log.data.clone(),
+            data: log.data.data.clone(),
             ..Default::default()
         }
     }
@@ -439,8 +461,6 @@ fn build_trace_node(
     debank_node.trace.id = debank_node.trace.debank_id();
 
     let id = debank_node.trace.id.clone();
-    let contract_id = node.execution_address();
-
     let mut child_trace_address = Vec::new();
     for pos in &node.ordering {
         match pos {
@@ -470,7 +490,6 @@ fn build_trace_node(
             TraceMemberOrder::Log(i) => {
                 let mut child_event: DebankEvent = (&node.logs[*i]).into();
                 child_event.pos_in_parent_trace = debank_node.children.len();
-                child_event.contract_id = contract_id;
                 child_event.parent_trace_id = id.clone();
                 child_event.id = child_event.debank_id();
                 child_event.idx = *log_index;
@@ -867,6 +886,20 @@ mod tests {
     use reth_revm::db::{AccountStatus, EmptyDB, InMemoryDB};
     use revm::state::{AccountInfo, Bytecode};
     use revm_inspectors::tracing::types::{CallTrace, CallTraceNode};
+
+    #[test]
+    fn receipt_event_uses_raw_log_emitter() {
+        let emitter = Address::repeat_byte(0xaa);
+        let topic = H256::repeat_byte(0xbb);
+        let log = Log::new_unchecked(emitter, vec![topic], Bytes::from_static(&[0xcc]));
+        let event = DebankEvent::from(&log);
+        let inspected_event = DebankEvent::from(&CallLog::from(log));
+
+        assert_eq!(event.contract_id, emitter);
+        assert_eq!(event.selector, topic.to_string());
+        assert_eq!(event.data, Bytes::from_static(&[0xcc]));
+        assert_eq!(inspected_event.contract_id, emitter);
+    }
 
     #[test]
     fn bundle_state_diff_filters_restored_slots_and_deduplicates_code() {

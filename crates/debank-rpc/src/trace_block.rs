@@ -10,7 +10,7 @@ use alloy_rpc_types_eth::Header;
 use jsonrpsee::core::RpcResult;
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_errors::{BlockExecutionError, RethError};
-use reth_evm::{ConfigureEvm, Evm, block::TxResult, execute::BlockExecutor};
+use reth_evm::{ConfigureEvm, Evm, execute::BlockExecutor};
 use reth_primitives_traits::BlockBody;
 use reth_provider::ChainSpecProvider;
 use reth_revm::{State, database::StateProviderDatabase};
@@ -29,7 +29,11 @@ use revm::{
     interpreter::{CallInputs, CallOutcome, CallScheme, CreateInputs, CreateOutcome},
 };
 use revm_inspectors::tracing::{OpcodeFilter, TracingInspector, TracingInspectorConfig};
-use std::{mem, str::FromStr};
+use std::{
+    collections::{HashMap, VecDeque},
+    mem,
+    str::FromStr,
+};
 use tempo_evm::TempoEvmConfig;
 use tempo_revm::evm::TempoContext;
 
@@ -168,20 +172,124 @@ fn root_trace_misclassified(error_traces: &[DebankTrace]) -> bool {
         .any(|trace| trace.trace_address.is_empty())
 }
 
-fn successful_receipt_event_count(
-    error_traces: &[DebankTrace],
-    events: &[DebankEvent],
-    error_events: &[DebankEvent],
-) -> usize {
-    if root_trace_misclassified(error_traces) {
-        // Tempo AA execution can mark the whole arena as failed even when the receipt succeeds.
-        // In that case all inspector events are persisted receipt events.
-        events.len() + error_events.len()
-    } else {
-        // Logs emitted by a reverted internal call are inspector-visible but absent from the
-        // receipt, so they must not hide handler-injected fee logs at the end of exec_logs.
-        events.len()
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct EventPayloadKey {
+    contract_id: Address,
+    selector: String,
+    topics: Vec<String>,
+    data: alloy_primitives::Bytes,
+}
+
+impl From<&DebankEvent> for EventPayloadKey {
+    fn from(event: &DebankEvent) -> Self {
+        Self {
+            contract_id: event.contract_id,
+            selector: event.selector.clone(),
+            topics: event.topics.clone(),
+            data: event.data.clone(),
+        }
     }
+}
+
+fn with_event_index(mut event: DebankEvent, next_event_index: &mut usize) -> DebankEvent {
+    event.idx = *next_event_index;
+    *next_event_index += 1;
+    event
+}
+
+/// Reconciles inspector-visible logs with the authoritative logs in the replayed receipt.
+///
+/// Tempo transaction handlers can emit logs both before and after EVM calls. Inspector-only logs
+/// come from reverted frames; receipt-only logs come from handler code outside the interpreter.
+/// Greedily matching equal payloads in order preserves call-trace parents without assuming that
+/// handler logs form a suffix.
+fn reconcile_persisted_events(
+    events: Vec<DebankEvent>,
+    error_events: Vec<DebankEvent>,
+    persisted_events: Vec<DebankEvent>,
+    root_trace: Option<&DebankTrace>,
+    next_event_index: &mut usize,
+) -> (Vec<DebankEvent>, Vec<DebankEvent>) {
+    let mut candidates = events;
+    candidates.extend(error_events);
+    candidates.sort_by_key(|event| event.idx);
+
+    let mut candidate_indices: HashMap<EventPayloadKey, VecDeque<usize>> = HashMap::new();
+    for (index, event) in candidates.iter().enumerate() {
+        candidate_indices
+            .entry(event.into())
+            .or_default()
+            .push_back(index);
+    }
+
+    let mut matches = Vec::new();
+    let mut last_candidate_index = None;
+    for (receipt_index, event) in persisted_events.iter().enumerate() {
+        let Some(indices) = candidate_indices.get_mut(&event.into()) else {
+            continue;
+        };
+        while indices
+            .front()
+            .is_some_and(|index| last_candidate_index.is_some_and(|last| *index <= last))
+        {
+            indices.pop_front();
+        }
+        if let Some(candidate_index) = indices.pop_front() {
+            matches.push((receipt_index, candidate_index));
+            last_candidate_index = Some(candidate_index);
+        }
+    }
+
+    let root_trace_id = root_trace.map(|trace| trace.id.clone()).unwrap_or_default();
+    let mut next_root_position = root_trace.map(|trace| trace.subtraces).unwrap_or_default()
+        + candidates
+            .iter()
+            .filter(|event| event.parent_trace_id == root_trace_id)
+            .count();
+    let mut reconciled_events = Vec::with_capacity(persisted_events.len());
+    let mut reconciled_error_events = Vec::new();
+    let mut receipt_cursor = 0;
+    let mut candidate_cursor = 0;
+
+    for (receipt_index, candidate_index) in matches {
+        for mut event in persisted_events[receipt_cursor..receipt_index]
+            .iter()
+            .cloned()
+        {
+            event.parent_trace_id = root_trace_id.clone();
+            event.pos_in_parent_trace = next_root_position;
+            next_root_position += 1;
+            event.id = event.debank_id();
+            reconciled_events.push(with_event_index(event, next_event_index));
+        }
+        for event in candidates[candidate_cursor..candidate_index]
+            .iter()
+            .cloned()
+        {
+            reconciled_error_events.push(with_event_index(event, next_event_index));
+        }
+
+        reconciled_events.push(with_event_index(
+            candidates[candidate_index].clone(),
+            next_event_index,
+        ));
+        receipt_cursor = receipt_index + 1;
+        candidate_cursor = candidate_index + 1;
+    }
+
+    // Inspector-only trailing logs execute before handler-generated receipt suffix logs.
+    for event in candidates[candidate_cursor..].iter().cloned() {
+        reconciled_error_events.push(with_event_index(event, next_event_index));
+    }
+    for mut event in persisted_events[receipt_cursor..].iter().cloned() {
+        event.parent_trace_id = root_trace_id.clone();
+        event.pos_in_parent_trace = next_root_position;
+        next_root_position += 1;
+        event.id = event.debank_id();
+        reconciled_events.push(with_event_index(event, next_event_index));
+    }
+
+    (reconciled_events, reconciled_error_events)
 }
 
 /// `trace` namespace API implementation for `debankBlock`.
@@ -395,40 +503,10 @@ where
             debank_txs.push(dtx);
         }
 
-        // Receipt statuses + logs per tx.
-        // ReceiptResponse trait doesn't expose logs(). Extract via serde
-        // round-trip to alloy_rpc_types_eth::Log (a standard, stable type).
+        // Receipt statuses are used for final success/error classification. Event payloads come
+        // from the receipts produced by the replay executor below, so they are covered by the
+        // receipts-root validation rather than a fallible RPC serde round-trip.
         let tx_statuses: Vec<bool> = receipts.iter().map(|r| r.status()).collect();
-        let receipt_logs_per_tx: Vec<Vec<DebankEvent>> = receipts
-            .iter()
-            .map(|receipt| {
-                let logs: Vec<alloy_rpc_types_eth::Log> = serde_json::to_value(receipt)
-                    .ok()
-                    .and_then(|v| v.get("logs").cloned())
-                    .and_then(|v| serde_json::from_value(v).ok())
-                    .unwrap_or_default();
-                logs.iter()
-                    .enumerate()
-                    .map(|(log_idx, log)| {
-                        let selector = log
-                            .topics()
-                            .first()
-                            .map(|h| h.to_string())
-                            .unwrap_or_default();
-                        let topics: Vec<String> =
-                            log.topics().iter().skip(1).map(|h| h.to_string()).collect();
-                        DebankEvent {
-                            contract_id: log.address(),
-                            selector,
-                            topics,
-                            data: log.data().data.clone(),
-                            idx: log_idx,
-                            ..Default::default()
-                        }
-                    })
-                    .collect()
-            })
-            .collect();
 
         let parent_hash = block.parent_hash();
         let parent_block = self.eth_api.recovered_block(parent_hash.into()).await?;
@@ -455,7 +533,6 @@ where
         let (evm_env, _) = self.eth_api.evm_env_at(resolved_block_id).await?;
 
         let parent_block_id = BlockId::hash(parent_hash);
-        let tx_statuses_clone = tx_statuses.clone();
 
         let (traces_result, state_diff, change_addresses) = self
             .eth_api
@@ -488,14 +565,13 @@ where
                 // transaction with a fresh inspector.
                 *executor.evm_mut().components_mut().1 = new_debank_inspector();
 
-                let log_index = std::cell::RefCell::new(0usize);
-                // (traces, error_traces, events, error_events, receipt_log_count)
+                let mut next_event_index = 0usize;
+                // (traces, error_traces, events, error_events)
                 type PerTxResult = (
                     Vec<DebankTrace>,
                     Vec<DebankTrace>,
                     Vec<DebankEvent>,
                     Vec<DebankEvent>,
-                    usize,
                 );
                 let mut all_results: Vec<PerTxResult> = Vec::new();
 
@@ -505,7 +581,6 @@ where
                     let output = executor
                         .execute_transaction_without_commit(tx)
                         .map_err(Eth::Error::from_eth_err)?;
-                    let exec_logs = output.result().result.logs().to_vec();
 
                     let (inspector, native_storage_inspector) = mem::replace(
                         executor.evm_mut().components_mut().1,
@@ -527,125 +602,41 @@ where
                             native_storage_changes.len(),
                         ))));
                     }
+                    let inspector_log_index = std::cell::RefCell::new(0usize);
                     let (traces, error_traces, events, error_events) =
                         build_debank_traces(
                             tx_hash,
                             arena,
                             &native_storage_changes,
-                            &log_index,
+                            &inspector_log_index,
                         );
 
                     executor.commit_transaction(output);
-
-                    // Append fee logs not captured by the inspector.
-                    //
-                    // For successful txs: exec_logs (from ExecutionResult::Success)
-                    // contains all logs including handler fee logs. Extra logs beyond
-                    // what the inspector captured are fee events.
-                    //
-                    // For reverted txs: ExecutionResult::Revert has NO logs (exec_logs
-                    // is empty). ALL receipt logs are handler-injected fee logs (EVM
-                    // logs are reverted and don't enter the receipt). Use receipt logs
-                    // directly — do NOT compare with evm_event_count, because the
-                    // inspector may have captured N error_events from pre-revert emits,
-                    // and receipt_log_count (fee only) < N would cause fee log loss.
-                    let tx_reverted = !tx_statuses_clone.get(idx).copied().unwrap_or(true);
-                    let persisted_evm_event_count = successful_receipt_event_count(
-                        &error_traces,
-                        &events,
-                        &error_events,
-                    );
-                    let receipt_logs = receipt_logs_per_tx.get(idx).cloned().unwrap_or_default();
-
-                    all_results.push((
-                        traces,
-                        error_traces,
+                    let persisted_events = executor
+                        .receipts()
+                        .get(idx)
+                        .ok_or_else(|| {
+                            Eth::Error::from_eth_err(BlockExecutionError::msg(format!(
+                                "trace_debankBlock missing replayed receipt for transaction {tx_hash}"
+                            )))
+                        })?
+                        .logs()
+                        .iter()
+                        .map(DebankEvent::from)
+                        .collect();
+                    let root_trace = traces
+                        .iter()
+                        .chain(&error_traces)
+                        .find(|trace| trace.trace_address.is_empty());
+                    let (events, error_events) = reconcile_persisted_events(
                         events,
                         error_events,
-                        receipt_logs.len(),
-                    ));
+                        persisted_events,
+                        root_trace,
+                        &mut next_event_index,
+                    );
 
-                    // Determine fee log source: exec_logs for success, receipt for revert.
-                    // Use block-global log_index for idx (not tx-local offset).
-                    let extra_log_source: Vec<DebankEvent> = if tx_reverted {
-                        // Revert path: all receipt logs are fee logs
-                        receipt_logs
-                            .iter()
-                            .map(|rl| {
-                                let current_idx = *log_index.borrow();
-                                *log_index.borrow_mut() += 1;
-                                DebankEvent {
-                                    contract_id: rl.contract_id,
-                                    selector: rl.selector.clone(),
-                                    topics: rl.topics.clone(),
-                                    data: rl.data.clone(),
-                                    idx: current_idx,
-                                    ..Default::default()
-                                }
-                            })
-                            .collect()
-                    } else if exec_logs.len() > persisted_evm_event_count {
-                        // Success path: use exec_logs beyond inspector-captured events
-                        exec_logs[persisted_evm_event_count..]
-                            .iter()
-                            .map(|log| {
-                                let selector = log
-                                    .topics()
-                                    .first()
-                                    .map(|h| h.to_string())
-                                    .unwrap_or_default();
-                                let topics = if log.topics().len() > 1 {
-                                    log.topics()[1..].iter().map(|h| h.to_string()).collect()
-                                } else {
-                                    vec![]
-                                };
-                                let current_idx = *log_index.borrow();
-                                *log_index.borrow_mut() += 1;
-                                DebankEvent {
-                                    contract_id: log.address,
-                                    selector,
-                                    topics,
-                                    data: log.data.data.clone(),
-                                    idx: current_idx,
-                                    ..Default::default()
-                                }
-                            })
-                            .collect()
-                    } else {
-                        vec![]
-                    };
-
-                    if !extra_log_source.is_empty() {
-                        let last = all_results.last().unwrap();
-                        let root_trace_id = last
-                            .0
-                            .first()
-                            .or(last.1.first())
-                            .map(|t| t.id.clone())
-                            .unwrap_or_default();
-                        // Compute base pos from root trace's subtraces + all events
-                        // already attached to it, to avoid pos collision with EVM events.
-                        let root_subtraces = last
-                            .0
-                            .first()
-                            .or(last.1.first())
-                            .map(|t| t.subtraces)
-                            .unwrap_or(0);
-                        let existing_events_on_root = last
-                            .2
-                            .iter()
-                            .chain(last.3.iter())
-                            .filter(|e| e.parent_trace_id == root_trace_id)
-                            .count();
-                        let fee_pos = root_subtraces + existing_events_on_root;
-
-                        for (offset, mut fee_event) in extra_log_source.into_iter().enumerate() {
-                            fee_event.parent_trace_id = root_trace_id.clone();
-                            fee_event.pos_in_parent_trace = fee_pos + offset;
-                            fee_event.id = fee_event.debank_id();
-                            all_results.last_mut().unwrap().2.push(fee_event);
-                        }
-                    }
+                    all_results.push((traces, error_traces, events, error_events));
                 }
 
                 let (evm, execution_result) = executor
@@ -709,21 +700,23 @@ where
         //
         // 2. Successful tx, root trace misclassified (in error_traces):
         //    AA tx — CallTraceArena marks the handler wrapper and its
-        //    children as success=false even though the tx succeeds. The
-        //    arena's success flags are unreliable for the entire tree,
-        //    so merge all error_traces/events into success lists.
+        //    children as success=false even though the tx succeeds. Merge
+        //    traces, but keep inspector-only logs in error_events because
+        //    receipt reconciliation has already identified persisted events.
         //
         // 3. Failed tx: all traces/events go to error lists.
-        for (idx, (mut trace, mut error_trace, mut event, mut error_event, _)) in
+        for (idx, (mut trace, mut error_trace, event, mut error_event)) in
             traces_result.into_iter().enumerate()
         {
             let tx_success = tx_statuses.get(idx).copied().unwrap_or(true);
             if tx_success {
                 let root_misclassified = root_trace_misclassified(&error_trace);
                 if root_misclassified {
-                    // AA tx: arena success flags unreliable, merge all
+                    // AA tx: arena call success flags are unreliable, so merge traces. Events were
+                    // already reconciled against the replayed receipt; inspector-only events must
+                    // remain in the error list.
                     trace.extend(error_trace);
-                    event.extend(error_event);
+                    block_file.error_events.extend(error_event);
                 } else {
                     // Normal tx: keep per-node classification (try/catch)
                     block_file.error_traces.extend(error_trace);
@@ -859,28 +852,61 @@ mod tests {
     }
 
     #[test]
-    fn reverted_internal_events_do_not_hide_fee_logs() {
-        let internal_error_trace = DebankTrace {
-            trace_address: vec![0],
+    fn receipt_reconciliation_handles_handler_and_reverted_logs() {
+        fn event(marker: u8, idx: usize, parent_trace_id: &str) -> DebankEvent {
+            DebankEvent {
+                contract_id: Address::repeat_byte(marker),
+                selector: format!("0x{marker:02x}"),
+                topics: vec![format!("0x{marker:064x}")],
+                data: vec![marker].into(),
+                parent_trace_id: parent_trace_id.to_string(),
+                idx,
+                ..Default::default()
+            }
+        }
+
+        let root = DebankTrace {
+            id: "root".to_string(),
+            subtraces: 2,
             ..Default::default()
         };
-        assert_eq!(
-            successful_receipt_event_count(
-                &[internal_error_trace],
-                &[DebankEvent::default()],
-                &[DebankEvent::default()],
-            ),
-            1
+        let captured_b = event(0xb0, 0, "child");
+        let reverted = event(0xee, 1, "child");
+        let captured_c = event(0xc0, 2, "child");
+        let persisted = vec![
+            event(0xa0, 0, ""),
+            event(0xb0, 0, ""),
+            event(0xc0, 0, ""),
+            event(0xd0, 0, ""),
+        ];
+        let mut next_event_index = 0;
+
+        let (events, error_events) = reconcile_persisted_events(
+            vec![captured_b, captured_c],
+            vec![reverted],
+            persisted,
+            Some(&root),
+            &mut next_event_index,
         );
 
-        let misclassified_root = DebankTrace::default();
         assert_eq!(
-            successful_receipt_event_count(
-                &[misclassified_root],
-                &[DebankEvent::default()],
-                &[DebankEvent::default()],
-            ),
-            2
+            events
+                .iter()
+                .map(|event| event.selector.as_str())
+                .collect::<Vec<_>>(),
+            vec!["0xa0", "0xb0", "0xc0", "0xd0"]
         );
+        assert_eq!(error_events.len(), 1);
+        assert_eq!(error_events[0].selector, "0xee");
+        assert_eq!(error_events[0].idx, 2);
+        assert_eq!(
+            events.iter().map(|event| event.idx).collect::<Vec<_>>(),
+            vec![0, 1, 3, 4]
+        );
+        assert_eq!(events[0].parent_trace_id, "root");
+        assert_eq!(events[0].pos_in_parent_trace, 2);
+        assert_eq!(events[1].parent_trace_id, "child");
+        assert_eq!(events[3].parent_trace_id, "root");
+        assert_eq!(events[3].pos_in_parent_trace, 3);
     }
 }
