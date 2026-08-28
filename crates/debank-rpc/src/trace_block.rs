@@ -223,6 +223,13 @@ fn root_trace_misclassified(error_traces: &[DebankTrace]) -> bool {
         .any(|trace| trace.trace_address.is_empty())
 }
 
+fn debank_transaction_target(
+    recipient: Option<Address>,
+    contract_address: Option<Address>,
+) -> Address {
+    recipient.or(contract_address).unwrap_or_default()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct EventPayloadKey {
     contract_id: Address,
@@ -472,10 +479,6 @@ where
             let tx = &block_txs[index];
             let receipt = &receipts[index];
 
-            // Extract 0x76 AA tx fields via serde round-trip.
-            // Cannot use tempo_primitives directly (workspace feature unification
-            // causes reth_codecs::Compact compile errors). Serialize the tx and
-            // extract AA-specific fields from the JSON.
             // Extract 0x76 AA tx fields from serde JSON.
             let tx_json = serde_json::to_value(tx).unwrap_or_default();
             let is_aa = tx_json.get("type").and_then(|t| t.as_str()) == Some("0x76");
@@ -488,7 +491,7 @@ where
             let mut dtx = DebankTransaction {
                 id: receipt.transaction_hash().to_string(),
                 from: receipt.from(),
-                to: receipt.to().unwrap_or_default(),
+                to: debank_transaction_target(receipt.to(), receipt.contract_address()),
                 gas_limit: tx.gas_limit(),
                 gas_price: receipt.effective_gas_price(),
                 gas_used: receipt.gas_used(),
@@ -946,6 +949,17 @@ mod tests {
         assert_eq!(
             inspector.into_changes(),
             vec![(root, false), (precompile, true)]
+        );
+    }
+
+    #[test]
+    fn transaction_target_uses_created_address_for_create() {
+        let created = Address::repeat_byte(0x33);
+
+        assert_eq!(debank_transaction_target(None, Some(created)), created);
+        assert_eq!(
+            debank_transaction_target(Some(Address::repeat_byte(0x44)), Some(created)),
+            Address::repeat_byte(0x44)
         );
     }
 
