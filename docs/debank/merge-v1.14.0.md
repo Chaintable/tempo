@@ -1,6 +1,6 @@
 # Tempo v1.14.0 upstream 合并验证
 
-日期：2026-09-08。状态：合并完成，编译和回归进行中；测试机验证待资源条件满足。本报告未宣称可交付 release。
+日期：2026-09-08。状态：合并、本地 binary build 与 RPC/EVM/precompile 回归完成；consensus 回归完成，双架构 CI 已通过，测试机验证待资源条件满足。本报告未宣称可交付 release。
 
 ## 1. 升级内容与必要性
 
@@ -24,13 +24,17 @@ Cargo.lock 以 upstream v1.14.0 为基底。结构化对账确认没有移除或
 
 测试部署尚未执行。lihe-dev 有 93.19GiB 物理内存，已有限额容器合计 93GiB，另有不设限的 morph-archive-trace-test，违反总限额加 8GiB 的部署条件。现有 Tempo 节点供另一套 T11 pipeline 使用，未替换或停止。候选生产周期快照为 snap-00c445d5bb1442d9c（2026-09-04 05:02 UTC，60GiB），后续新测试卷使用初始化速率 300MiB/s，不启用生产快照 FSR。
 
-Compose 将在镜像确定后补入独立部署附件；未对生产或其他测试任务做变更。
+部署 Compose 见附录，已通过 config 校验；该配置尚未启动。未对生产或其他测试任务做变更。
 
 ## 4. 测试结果
 
 - merge 冲突已解决；本次改动的 Rust/Cargo 文件 diff --check 通过。上游 TIP 文档及存量 fork 文档的 whitespace 问题保留原状。
 - 首次 check 定位 Trace::inspect API 不兼容，已按第 2 节适配。
-- `cargo check --workspace --locked` 通过（2m06s，含 tempo、node、EVM、e2e）；适用单测、binary build、双架构 CI 进行中。
+- `cargo check --workspace --locked` 通过（2m06s，含 tempo、node、EVM、e2e）；`cargo build --locked --bin tempo` 通过（2m26s）。
+- `cargo test --locked -p debank-rpc -p tempo-precompiles -p tempo-evm --lib -- --test-threads=2`：20 + 1005 + 101 = 1126 passed，0 failed；唯一 ignored 是上游原有 TIP-1016 refund 预期差异用例，未改测试或跳过逻辑。
+- 本地独立 dev 节点：trace_debankBlock（genesis/空块/非空 TIP-20 转账）、eth_multiCall、pre_traceMany 冒烟通过；转账 block 0x40 的 header hash 匹配 receipt，2 events 对应 2 receipt logs，1 trace、1125-byte state diff。
+- T10/T11+ 两份 dev genesis 对照：带32-byte尾随数据的 decimals() 由成功变为 revert；规范调用 pre_traceMany gas=271170→271194，差24，符合输入每 word 6→30 gas。两个测试节点均已停止。
+- `cargo test --locked -p tempo-consensus --lib -- --test-threads=2`：290 passed、0 failed，65.06s；本地单测累计1416 passed。双架构 CI 已通过，draft PR #11 / run 34174121220。
 - 测试机同步、两段各 20 块 hash、自定义 RPC parity：未执行。
 - T11 主网尚未激活，不预报激活后真实链验证结果。
 
@@ -39,3 +43,62 @@ Compose 将在镜像确定后补入独立部署附件；未对生产或其他测
 [PR #10](https://github.com/Chaintable/tempo/pull/10) 的完整 executor 生命周期、AA trace/event/state-diff 修复保持独立 review，未并入本分支。此次保持生产分支既有 RPC 行为，不把其已知缺陷误算为 v1.14.0 新增问题；也不宣称 writer-to-Leafage 全链路通过。PR #10 所述 Leafage storage-wipe consumer 依赖需另行验证。
 
 需要先解决测试资源条件，再完成运行验证与本报告；用户 review/merge PR 后才进入 release，生产切换由 SRE 执行。
+
+## 已验证的 PR 镜像
+
+源码 commit `3aae0294107d4d4323c47a0e5244733427161e00`；[CI run 34174121220](https://github.com/Chaintable/tempo/actions/runs/34174121220) 的 amd64、arm64 与 manifest job 全部 success，ECR manifest 平台和 digest 已对账。后续报告提交只改 docs，以下镜像仍对应相同 Rust/Cargo/Dockerfile 源码。
+
+- Registry/repo：`294354037686.dkr.ecr.ap-northeast-1.amazonaws.com/blockchain/tempo`
+- `3aae029` manifest：`sha256:fbb035a92bbb1e390df6b857c96aabd0f371c52d75393927706a3ec89d6fc408`
+- `amd64-3aae029`：`sha256:f973791d11c936ea68d09084e9f60dc99f408d1ae2459773740c9d9d87ad5015`
+- `arm64-3aae029`：`sha256:5e7eee5507b47d3204ee28017b9fffc23e57d08b3bf9c6bab6406b55ebb6a462`
+
+## 附录：待执行的独立测试 Compose
+
+```yaml
+name: tempo-upstream-v1140
+services:
+  node:
+    image: 294354037686.dkr.ecr.ap-northeast-1.amazonaws.com/blockchain/tempo:amd64-3aae029@sha256:f973791d11c936ea68d09084e9f60dc99f408d1ae2459773740c9d9d87ad5015
+    container_name: tempo-upstream-v1140-node
+    entrypoint: ["/usr/local/bin/tempo"]
+    command:
+      - node
+      - --chain=mainnet
+      - --datadir=/var/data
+      - --follow=auto
+      - --log.stdout.filter=info
+      - --http
+      - --http.addr=0.0.0.0
+      - --http.port=8545
+      - --http.api=all
+      - --ws
+      - --ws.addr=0.0.0.0
+      - --ws.port=8546
+      - --ws.api=all
+      - --port=30303
+      - --discovery.port=30303
+    user: "0:0"
+    restart: unless-stopped
+    stop_grace_period: 5m
+    mem_limit: 6g
+    cpus: 4
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "5"
+    volumes:
+      - /opt/app/tempo/writer_merge_v1.14.0/data:/var/data
+    ports:
+      - "127.0.0.1:18645:8545"
+      - "127.0.0.1:18646:8546"
+      - "31403:30303/tcp"
+      - "31403:30303/udp"
+    networks: [tempo-upstream]
+networks:
+  tempo-upstream:
+    ipam:
+      config:
+        - subnet: 10.42.18.0/24
+```

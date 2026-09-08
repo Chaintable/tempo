@@ -60,3 +60,16 @@
 
 - `[2026-09-08][done] 完整 locked check` — cargo check --workspace --locked exit=0，2m06s。
   **Done:** Cargo.lock 保留全部 upstream package，只增加 debank-rpc/md-5 与 tempo-node dependency edge；改动 Rust 文件按 nightly rustfmt 校验。
+
+- `[2026-09-08][done] 本地 binary 与 T11 RPC fixture` — binary build 2m26s；RPC/EVM/precompile 单测1126 passed、0 failed、1 upstream ignored。
+  **Done:** dev RPC 冒烟、真实 TIP-20 转账重放、T10/T11 strict ABI 与24 gas差值验证通过；两个本地节点已停止。证据在 target/tempo-v1140-smoke-*.json，并复制到 pipeline runs/tempo/v1.14.0/。
+- `[2026-09-08][open] 镜像与主网验证` — draft PR #11，head 3aae029410，双架构 run 34174121220 进行中；consensus 单测另跑以验证 gossip/follow 变更。
+  **Decision:** 测试资源仍待安排；独立6GiB/4CPU Compose 已通过 config 校验，快照 volume --plan 91.8h/60GiB 合格，未创建卷或容器。
+
+- `[2026-09-08][done] Consensus 回归` — 290 passed、0 failed、0 ignored，65.06s。
+  **Done:** 本地单测总计1416 passed；volume --plan 实测91.8h/60GiB合格。双架构镜像与远程测试仍待完成。
+
+- `[2026-09-08][done] 双架构 CI 与 ECR manifest` — run 34174121220 三个 job 全 success，3aae029 manifest 包含正确的 linux/amd64 和 linux/arm64 digest。
+  **Done:** digest、Compose 全文和1416项单测/本地 RPC证据已记入 docs/debank/merge-v1.14.0.md；后续提交仅报告，测试仍使用经核验的3aae029源码镜像。
+- `[2026-09-08][open] 等待测试机预算例外确认` — 已展示独立6GiB/4CPU部署方案并向用户请求内存预算例外，尚未得到答复。
+  **Decision:** 不建卷、不启动远程容器；不代合 PR 或发 release。
