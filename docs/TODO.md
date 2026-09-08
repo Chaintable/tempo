@@ -73,3 +73,11 @@
   **Done:** digest、Compose 全文和1416项单测/本地 RPC证据已记入 docs/debank/merge-v1.14.0.md；后续提交仅报告，测试仍使用经核验的3aae029源码镜像。
 - `[2026-09-08][open] 等待测试机预算例外确认` — 已展示独立6GiB/4CPU部署方案并向用户请求内存预算例外，尚未得到答复。
   **Decision:** 不建卷、不启动远程容器；不代合 PR 或发 release。
+
+- `[2026-09-08][done] v1.14.0 测试部署与历史 RPC 对账` — 用户批准本轮测试机内存预算例外。
+  **Done:** 独立节点 01:29:25Z 启动，60GiB 卷 vol-0582fcb2fe3cf922a，初始高度 37,909,435；历史20块 hash/根、5非空块完整 trace/state diff 匹配。
+  **Decision:** pre_traceMany 的模拟交易 hash 来自 B256::random()，比较时仅在此方法去除此字段；近 head 检查仍待追块完成。
+
+- `[2026-09-08][done] v1.14.0 主网验证完成` — 约14.5分钟追平快照后约59.8万块，0 restart/OOM。
+  **Done:** 三段60个hash/各根、15个完整trace/state_diff、6组模拟RPC全部匹配；生产lag1、官方lag2–3，最终报告见 docs/debank/merge-v1.14.0.md。
+  **Decision:** 提交报告并转为可review PR；用户亲自merge后再构建release，PR #10与真实T11边界验证保持独立后续。

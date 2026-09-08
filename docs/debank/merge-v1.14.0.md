@@ -1,6 +1,6 @@
 # Tempo v1.14.0 upstream 合并验证
 
-日期：2026-09-08。状态：合并、本地 binary build 与 RPC/EVM/precompile 回归完成；consensus 回归完成，双架构 CI 已通过，测试机验证待资源条件满足。本报告未宣称可交付 release。
+日期：2026-09-08。结论：本轮 upstream 合并验证通过，等待用户 review/merge [PR #11](https://github.com/Chaintable/tempo/pull/11)。本地1416项测试、双架构 CI、主网追块、hash 与自定义 RPC 对账均通过；release 尚未创建。
 
 ## 1. 升级内容与必要性
 
@@ -22,9 +22,9 @@ Cargo.lock 以 upstream v1.14.0 为基底。结构化对账确认没有移除或
 
 生产只读实测：`production/blockchain-tempo` 两个 hybrid pod 运行 v1.13.0-debank，node/jrpcx Ready、restart=0；hybrid-0 syncing=false、16 peers，head 正常增长。测试采用单独常规节点，只开放 localhost RPC/metrics，不启 ETL/Kafka/S3/etcd 投递；首次启动前重建 P2P 身份。
 
-测试部署尚未执行。lihe-dev 有 93.19GiB 物理内存，已有限额容器合计 93GiB，另有不设限的 morph-archive-trace-test，违反总限额加 8GiB 的部署条件。现有 Tempo 节点供另一套 T11 pipeline 使用，未替换或停止。候选生产周期快照为 snap-00c445d5bb1442d9c（2026-09-04 05:02 UTC，60GiB），后续新测试卷使用初始化速率 300MiB/s，不启用生产快照 FSR。
+用户已明确批准本轮按实时内存余量继续，现场 available 70GiB。独立节点于 2026-09-08 01:29:25Z 在 lihe-dev 启动，6GiB / 4 CPU；未替换或停止供另一套 T11 pipeline 使用的现有 Tempo 节点。测试卷 vol-0582fcb2fe3cf922a 来自生产周期快照 snap-00c445d5bb1442d9c（2026-09-04 05:02 UTC，60GiB），初始化速率 300MiB/s，AWS 已确认初始化 100%，未启用 FSR。新卷独立 UUID 为 bf156665-a228-4d02-8fd4-4644ef0ce51f；P2P 文件移入本 run 的 identity-backup，启动时生成新身份。初始高度 37,909,435，archive 与已有 storage_v2=false 设置得到保留，T11=1789048800 已加载。
 
-部署 Compose 见附录，已通过 config 校验；该配置尚未启动。未对生产或其他测试任务做变更。
+部署 Compose 见附录，已通过 config 校验；配置已按镜像 digest 启动。未对生产或其他测试任务做变更。
 
 ## 4. 测试结果
 
@@ -34,15 +34,19 @@ Cargo.lock 以 upstream v1.14.0 为基底。结构化对账确认没有移除或
 - `cargo test --locked -p debank-rpc -p tempo-precompiles -p tempo-evm --lib -- --test-threads=2`：20 + 1005 + 101 = 1126 passed，0 failed；唯一 ignored 是上游原有 TIP-1016 refund 预期差异用例，未改测试或跳过逻辑。
 - 本地独立 dev 节点：trace_debankBlock（genesis/空块/非空 TIP-20 转账）、eth_multiCall、pre_traceMany 冒烟通过；转账 block 0x40 的 header hash 匹配 receipt，2 events 对应 2 receipt logs，1 trace、1125-byte state diff。
 - T10/T11+ 两份 dev genesis 对照：带32-byte尾随数据的 decimals() 由成功变为 revert；规范调用 pre_traceMany gas=271170→271194，差24，符合输入每 word 6→30 gas。两个测试节点均已停止。
-- `cargo test --locked -p tempo-consensus --lib -- --test-threads=2`：290 passed、0 failed，65.06s；本地单测累计1416 passed。双架构 CI 已通过，draft PR #11 / run 34174121220。
-- 测试机同步、两段各 20 块 hash、自定义 RPC parity：未执行。
-- T11 主网尚未激活，不预报激活后真实链验证结果。
+- `cargo test --locked -p tempo-consensus --lib -- --test-threads=2`：290 passed、0 failed，65.06s；本地单测累计1416 passed。双架构 CI 已通过，PR #11 / run 34174121220。
+- 01:37:29Z 已执行快照后596,954块至38,506,389；01:39:21Z MerkleExecute 完成，状态根校验通过；01:43:54Z Finish 至38,507,901并进入实时跟随，约14.5分钟追平。连续5次同步采样均syncing=false，生产lag=1、官方lag=2–3；三个端点chainId均4217。
+- 新代码导入段37,909,436–455与近head段38,507,800–819：各20块hash及四项根全部匹配；各5个非空块完整trace/事件/state_diff匹配。trace抽样分别为37,909,437/442/447/450/454，以及38,507,801/802/803/805/807。
+- 主网历史段 37,909,000–37,909,019：20 块 hash、parentHash、stateRoot、receiptsRoot、transactionsRoot 全匹配。非空块 37,909,028 / 029 / 035 / 038 / 042 的 trace、事件与完整 state_diff 全匹配。三段合计60块hash/各根、15块非空trace/state_diff；eth_multiCall/pre_traceMany每段各一次，6组响应全匹配。
+- 对账规则：trace_debankBlock 仅去除 process_start_timestamp，并排序 storage_contracts 和 RLP 内无序集合；BlockStorageDiff 六个字段全部保留，不以 header.stateRoot 替代 diff。eth_multiCall 去除 timeCost；pre_traceMany 去除源码 pre.rs:140 明确随机生成的模拟 transactionHash，其余字段全部比较。
+- 运行状态：0 restart、OOM=false，启动以来无panic/FATAL/ERROR/invalid-block/state-root-mismatch；收尾内存672MiB / 6GiB，CPU约0.34核 / 4核，卷available7.5GiB，主机available69GiB。采样仍保留在独立测试目录。
+- T11 主网尚未激活；本轮覆盖历史主网与T10/T11+本地fixture，真实激活边界仍须在9月10日观察。
 
 ## 5. 待跟进事项
 
 [PR #10](https://github.com/Chaintable/tempo/pull/10) 的完整 executor 生命周期、AA trace/event/state-diff 修复保持独立 review，未并入本分支。此次保持生产分支既有 RPC 行为，不把其已知缺陷误算为 v1.14.0 新增问题；也不宣称 writer-to-Leafage 全链路通过。PR #10 所述 Leafage storage-wipe consumer 依赖需另行验证。
 
-需要先解决测试资源条件，再完成运行验证与本报告；用户 review/merge PR 后才进入 release，生产切换由 SRE 执行。
+用户 review/merge PR 后才进入 release 镜像构建与交付，生产切换由 SRE 执行。生产需要在T11激活前完成升级；本PR未包含PR #10的独立writer正确性修复。
 
 ## 已验证的 PR 镜像
 
@@ -53,7 +57,7 @@ Cargo.lock 以 upstream v1.14.0 为基底。结构化对账确认没有移除或
 - `amd64-3aae029`：`sha256:f973791d11c936ea68d09084e9f60dc99f408d1ae2459773740c9d9d87ad5015`
 - `arm64-3aae029`：`sha256:5e7eee5507b47d3204ee28017b9fffc23e57d08b3bf9c6bab6406b55ebb6a462`
 
-## 附录：待执行的独立测试 Compose
+## 附录：实际运行的独立测试 Compose
 
 ```yaml
 name: tempo-upstream-v1140
