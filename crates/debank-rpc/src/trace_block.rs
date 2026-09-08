@@ -9,24 +9,22 @@ use alloy_primitives::{Address, B256, U256};
 use alloy_rpc_types_eth::Header;
 use jsonrpsee::core::RpcResult;
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
-use reth_evm::ConfigureEvm;
+use reth_evm::{ConfigureEvm, Evm};
 use reth_primitives_traits::BlockBody;
 use reth_provider::ChainSpecProvider;
 use reth_revm::{State, database::StateProviderDatabase};
 use reth_rpc_eth_api::{
-    EthApiTypes,
+    EthApiTypes, FromEvmError,
     helpers::{
         EthBlocks, EthTransactions, LoadBlock, LoadReceipt, LoadState, SpawnBlocking, TraceExt,
     },
 };
-use reth_rpc_eth_types::{EthApiError, cache::db::StateProviderTraitObjWrapper};
-use revm::DatabaseCommit;
-use revm::bytecode::opcode::OpCode;
+use reth_rpc_eth_types::EthApiError;
+use revm::{DatabaseCommit, bytecode::opcode::OpCode};
 use revm_inspectors::tracing::{OpcodeFilter, TracingInspector, TracingInspectorConfig};
 use std::str::FromStr;
 
-use crate::debank_trace::*;
-use crate::state_diff_db::StateDiffTraceDB;
+use crate::{debank_trace::*, state_diff_db::StateDiffTraceDB};
 
 /// `trace` namespace API implementation for `debankBlock`.
 #[derive(Clone)]
@@ -298,14 +296,10 @@ where
                 let state2 = eth_api.state_at_block_id(parent_block_id).await?;
 
                 let pre_db = State::builder()
-                    .with_database(StateProviderDatabase::new(StateProviderTraitObjWrapper(
-                        state1,
-                    )))
+                    .with_database(StateProviderDatabase::new(state1))
                     .build();
                 let cache_db = State::builder()
-                    .with_database(StateProviderDatabase::new(StateProviderTraitObjWrapper(
-                        state2,
-                    )))
+                    .with_database(StateProviderDatabase::new(state2))
                     .build();
                 let mut diff_db = StateDiffTraceDB::new(cache_db);
 
@@ -336,7 +330,11 @@ where
                     let revm::context::result::ResultAndState {
                         result: exec_result,
                         state,
-                    } = eth_api.inspect(&mut diff_db, evm_env.clone(), tx_env, &mut inspector)?;
+                    } = eth_api
+                        .evm_config()
+                        .evm_with_env_and_inspector(&mut diff_db, evm_env.clone(), &mut inspector)
+                        .transact(tx_env)
+                        .map_err(Eth::Error::from_evm_err)?;
                     diff_db.commit(state);
 
                     let exec_logs = exec_result.into_logs();

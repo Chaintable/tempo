@@ -33,6 +33,18 @@ def log-filter-args [loud: bool] {
     if $loud { [] } else { ["--log.stdout.filter" "info"] }
 }
 
+# Keep benchmark OTLP logs useful without emitting high-volume HTTP transport internals.
+def benchmark-otlp-args [endpoint: string] {
+    if $endpoint == "" {
+        []
+    } else {
+        [
+            $"--tracing-otlp=($endpoint)"
+            "--logs-otlp.filter=debug,h2=off,hyper=off,hyper_util=off"
+        ]
+    }
+}
+
 def prepare-localnet-consensus-secret-fifo [node_dir: string] {
     let secret_path = $"($node_dir)/consensus-secret.fifo"
     rm -f $secret_path
@@ -676,7 +688,7 @@ def run-bench-single [
         | append (build-dev-args)
         | append (log-filter-args $loud)
         | append (if $tracy != "off" { ["--log.tracy" "--log.tracy.filter" $tracy_filter] } else { [] })
-        | append (if $tracing_otlp != "" { [$"--tracing-otlp=($tracing_otlp)"] } else { [] })
+        | append (benchmark-otlp-args $tracing_otlp)
     let args = (dedup-args $base_args $extra_args)
 
     # Tracy environment variables
@@ -2430,7 +2442,7 @@ def "main bench" [
     --tps: int = 10000                              # Target TPS
     --duration: int = 30                            # Duration in seconds
     --accounts: int = 1000                          # Number of accounts
-    --max-concurrent-requests: int = 5000           # Max concurrent requests
+    --max-concurrent-requests: int = 100            # Max concurrent requests
     --nodes: int = 3                                # Number of consensus nodes (consensus mode only)
     --genesis: string = ""                          # Custom genesis file path (skips generation)
     --samply                                        # Profile nodes with samply
@@ -3518,7 +3530,7 @@ def main [] {
     print "  --tps <N>                Target TPS (default: 10000)"
     print "  --duration <N>           Duration in seconds (default: 30)"
     print "  --accounts <N>           Number of accounts (default: 1000)"
-    print "  --max-concurrent-requests <N>  Max concurrent requests (default: 5000)"
+    print "  --max-concurrent-requests <N>  Max concurrent requests (default: 100)"
     print "  --nodes <N>              Number of consensus nodes (default: 3, consensus mode only)"
     print "  --samply                 Profile nodes with samply"
     print "  --samply-args <ARGS>     Additional samply arguments (space-separated)"
