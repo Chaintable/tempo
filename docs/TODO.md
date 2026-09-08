@@ -45,3 +45,18 @@
 - ECR: `294354037686.dkr.ecr.ap-northeast-1.amazonaws.com/blockchain/tempo:v1.4.3`
 - Release: https://github.com/DeBankDeFi/tempo/releases/tag/v1.4.3
 - 线上节点: data/pre/trace/archive.tempo.blockchain
+
+## 2026-09-08 upstream v1.14.0
+
+- `[2026-09-08][decided] 独立合并 v1.14.0` — 用户已确认 pipeline Step1 GO，从 origin/debank eb52df687 创建 merge-v1.14.0；PR #10 保留独立 review。
+  **Decision:** 保留 DeBank RPC crate、注册及 build/release workflow；目标 upstream Cargo.lock 为基底，补 fork 依赖，保留现行 Rust 1.96 toolchain。CI 冲突保持现行 upstream workflow 删除策略；node.rs 合并双方 import。
+- `[2026-09-08][open] 编译与语义验证` — Reth 状态读取路径变更需验证 DeBank 三个 RPC；T11 gas、ABI、nonce 与历史 fork replay 为回归重点。
+  **Decision:** 先跑完整 locked check/build 和适用测试，再提交 PR 镜像、部署隔离常规节点；生产操作交 SRE。
+- `[2026-09-08][decided] Reth state provider API 适配` — 上游删除 StateProviderTraitObjWrapper，state_at_block_id 仍返回 StateProviderBox。
+  **Decision:** 仿照目标 Reth 的 spawn_with_state_at_block，将 boxed provider 直接交给 StateProviderDatabase；保留两个独立的同一 parent-hash provider 和现有 replay 逻辑。
+  **Decision:** 首次 check 复现 E0308：Trace::inspect 新签名只收 StateCacheDb，不能接受 StateDiffTraceDB。对照旧/新 Reth 实现确认均为 evm_with_env_and_inspector → transact → from_evm_err，因此在 DeBank wrapper 路径直接使用同一 EVM factory 调用，保留 diff_db.commit；不移除 state-diff 捕获。
+- `[2026-09-08][open] lihe-dev 部署资源不足` — 物理 93.19GiB；已有限额容器合计 93GiB，另有无内存/CPU 限额的 morph-archive-trace-test（实用 8.218GiB），不满足总限额加 8GiB 的上机规则。
+  **Decision:** 不新增测试容器、不停止其他任务；先完成本地验证和 PR 镜像，并准备可审核的部署方案。现有 Tempo 节点 amd64-0a36d6f 同时被 T11 pipeline 使用，不能直接换镜像。
+
+- `[2026-09-08][done] 完整 locked check` — cargo check --workspace --locked exit=0，2m06s。
+  **Done:** Cargo.lock 保留全部 upstream package，只增加 debank-rpc/md-5 与 tempo-node dependency edge；改动 Rust 文件按 nightly rustfmt 校验。

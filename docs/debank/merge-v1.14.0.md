@@ -28,7 +28,7 @@ Compose 将在镜像确定后补入独立部署附件；未对生产或其他测
 
 ## 4. 测试结果
 
-- merge 冲突已解决；git diff --check 通过。
+- merge 冲突已解决；本次改动的 Rust/Cargo 文件 diff --check 通过。上游 TIP 文档及存量 fork 文档的 whitespace 问题保留原状。
 - 首次 check 定位 Trace::inspect API 不兼容，已按第 2 节适配。
 - `cargo check --workspace --locked` 通过（2m06s，含 tempo、node、EVM、e2e）；适用单测、binary build、双架构 CI 进行中。
 - 测试机同步、两段各 20 块 hash、自定义 RPC parity：未执行。
