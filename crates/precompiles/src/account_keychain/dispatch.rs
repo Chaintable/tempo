@@ -110,8 +110,7 @@ mod tests {
     };
     use tempo_chainspec::hardfork::TempoHardfork;
     use tempo_contracts::precompiles::{
-        IAccountKeychain::{IAccountKeychainCalls, setAllowedCallsCall},
-        UnknownFunctionSelector, legacyAuthorizeKeyCall,
+        IAccountKeychain::IAccountKeychainCalls, UnknownFunctionSelector, legacyAuthorizeKeyCall,
     };
 
     #[test]
@@ -221,7 +220,7 @@ mod tests {
         /// Builds the aliased calldata from the original Account Keychain decoder regression.
         fn aliased_set_allowed_calls_calldata(width: usize) -> Vec<u8> {
             let mut data = Vec::new();
-            data.extend(setAllowedCallsCall::SELECTOR);
+            data.extend(IAccountKeychain::setAllowedCallsCall::SELECTOR);
 
             // Function head: account and offset to CallScope[].
             data.extend(word(0));
