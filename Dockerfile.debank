@@ -18,12 +18,8 @@ ARG TARGETARCH
 ARG RUST_PROFILE=release
 ARG RUST_FEATURES="asm-keccak,jemalloc"
 ARG EXTRA_RUSTFLAGS=""
-ARG VERGEN_GIT_SHA
-ARG VERGEN_GIT_SHA_SHORT
 
-ENV VERGEN_GIT_SHA=${VERGEN_GIT_SHA} \
-    VERGEN_GIT_SHA_SHORT=${VERGEN_GIT_SHA_SHORT} \
-    VERGEN_DEFAULT_ON_ERROR=1
+ENV VERGEN_DEFAULT_ON_ERROR=1
 
 RUN apt-get update \
     && apt-get install --no-install-recommends -y \
@@ -51,6 +47,13 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked,id=cargo-
 
 # Build the tempo binary
 COPY . .
+
+# Source metadata must not invalidate the dependency-cooking layer.
+ARG VERGEN_GIT_SHA
+ARG VERGEN_GIT_SHA_SHORT
+ENV VERGEN_GIT_SHA=${VERGEN_GIT_SHA} \
+    VERGEN_GIT_SHA_SHORT=${VERGEN_GIT_SHA_SHORT}
+
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked,id=cargo-registry-${TARGETARCH} \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked,id=cargo-git-${TARGETARCH} \
     --mount=type=cache,target=$SCCACHE_DIR,sharing=locked,id=sccache-${TARGETARCH} \

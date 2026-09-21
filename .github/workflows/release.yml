@@ -1,0 +1,120 @@
+name: release
+
+# Versioned images, fired by a GitHub Release. The release TAG NAME becomes the image tag.
+# See "Cutting a release" for the tag naming convention (v<upstream-version>-ct.<N>).
+on:
+  release:
+    types: [created, released]
+
+env:
+  AWS_REGION: us-east-1
+  REGISTRY: public.ecr.aws/b2h7a5c4/chaintable
+  IMAGE_NAME: tempo          # keep identical to build.yml
+  CHAINS: "tempo"       # keep identical to build.yml
+  DOCKERFILE: Dockerfile.debank
+
+jobs:
+  build:
+    if: github.repository == 'Chaintable/tempo'
+    name: build-${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu2404-linux-x86-64-16c # Native amd64, Rust / large Go default
+            arch: amd64
+          - runner: ubuntu2204-arm64-16c       # Native arm64, Rust / large Go default
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Set revision (release tag name)
+        # GITHUB_REF is refs/tags/<tag> on a release event → REVISION = <tag>. Use the git ref,
+        # NOT github.event.release.tag_name, so re-runs stay stable (see pitfall on empty REVISION).
+        run: |
+          echo "SOURCE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "SOURCE_SHA_SHORT=$(git rev-parse --short=8 HEAD)" >> "$GITHUB_ENV"
+          echo "REVISION=${GITHUB_REF#refs/*/}" >> "$GITHUB_ENV"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@254c19bd240aabef8777f48595e9d2d7b972184b # v6.2.1
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Public ECR
+        uses: aws-actions/amazon-ecr-login@b040164c4934333d597f3f9c67502ff28f814e9c # v2.1.6
+        with:
+          registry-type: public
+
+      - name: Build & Push (per-arch)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ env.DOCKERFILE }}
+          platforms: linux/${{ matrix.arch }}
+          push: true                     # a release always publishes
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.REVISION }}-${{ matrix.arch }}
+          cache-from: type=gha,scope=build-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=build-${{ matrix.arch }}
+          build-args: |
+            VERGEN_GIT_SHA=${{ env.SOURCE_SHA }}
+            VERGEN_GIT_SHA_SHORT=${{ env.SOURCE_SHA_SHORT }}
+          provenance: false
+          sbom: false
+
+  manifest:
+    if: github.repository == 'Chaintable/tempo'
+    name: merge-manifest
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Set revision (release tag name)
+        run: |
+          echo "SOURCE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "SOURCE_SHA_SHORT=$(git rev-parse --short=8 HEAD)" >> "$GITHUB_ENV"
+          echo "REVISION=${GITHUB_REF#refs/*/}" >> "$GITHUB_ENV"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@254c19bd240aabef8777f48595e9d2d7b972184b # v6.2.1
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Public ECR
+        uses: aws-actions/amazon-ecr-login@b040164c4934333d597f3f9c67502ff28f814e9c # v2.1.6
+        with:
+          registry-type: public
+
+      - name: Merge multi-arch manifest + per-chain writer aliases
+        run: |
+          docker buildx imagetools create \
+            -t ${REGISTRY}/${IMAGE_NAME}:${REVISION} \
+            ${REGISTRY}/${IMAGE_NAME}:${REVISION}-amd64 \
+            ${REGISTRY}/${IMAGE_NAME}:${REVISION}-arm64
+          for c in ${CHAINS}; do
+            docker buildx imagetools create \
+              -t ${REGISTRY}/${c}-writer:${REVISION} \
+              ${REGISTRY}/${IMAGE_NAME}:${REVISION}
+          done
