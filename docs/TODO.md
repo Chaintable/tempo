@@ -1,13 +1,5 @@
 # Tempo 待办事项
 
-- `[2026-09-08][decided] 动态预编译storage-change漏标继续暂缓` — 本地TIP20转账复现既有问题；升级方案明确排除，用户此前已暂缓。
-  **Decision:** 曾草拟检测修复/回调测试，核对排除清单后全部撤回，未提交或推送。实验33项结果不计入最终候选；保留原32项测试与原始复现证据target/v114-validation/writer-smoke.json。
-
-- `[2026-09-08][decided] PR #10 整合正式 v1.14/T11` — 普通merge origin/debank=24340a99；保留PR #10完整executor重放、native inspector、receipt/gas/canonical diff校验。
-  **Decision:** 12处冲突以正式v1.14协议实现和PR #10导出链路为边界解决；删除旧Reth StateProviderTraitObjWrapper，直接用boxed provider。官方SDK引入属于后续Leafage独立PR。
-- `[2026-09-08][done] 整合后本地首轮回归` — Rust/Cargo1.96.1，locked debank-rpc/tempo-node check成功。
-  **Done:** debank-rpc32、consensus290、evm101、precompiles1006，共1429 passed/0 failed/1 upstream ignored；日志在target/v114-validation/。全workspace/build、CI、oracle及新pipeline组合仍待完成，不复用旧版本24h结果。
-
 ## 已完成
 
 - ~~ECR repo 创建~~ → `blockchain/tempo` 已创建，CI 已更新
