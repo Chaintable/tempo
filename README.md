@@ -1,3 +1,27 @@
+# Chaintable write node
+
+> Fork of [tempoxyz/tempo](https://github.com/tempoxyz/tempo), with Chaintable pipeline patches.
+
+## Architecture
+
+This repo runs Tempo's execution layer and exposes `trace_debankBlock`. The external [Chaintable pipeline](https://github.com/Chaintable/pipeline) `background-tracer` calls that RPC to extract block data — block headers, transactions, call traces, receipts, events, and state diffs — and ships it to **S3 + Kafka** (see pipeline's [architecture](https://github.com/Chaintable/pipeline/blob/main/docs/architecture.md)). Two consumption paths:
+
+- **Block headers + state diffs** → Kafka + S3 → [leafage-evm](https://github.com/Chaintable/leafage-evm): a lightweight EVM executor serving state queries (`eth_call`, `eth_estimateGas`, …), no P2P sync, no tx storage (see its [architecture](https://github.com/Chaintable/leafage-evm#architecture)).
+- **Block files** (transactions · call traces · receipts · events) → S3 → Chaintable's transaction/trace indexing pipeline.
+
+```
+Tempo write node (this repo · trace_debankBlock RPC)
+        │
+        ▼
+Chaintable background-tracer (separate process)
+        │
+        ├─ block headers + state diffs ──────────────────→ Kafka + S3 ─→ leafage-evm (EVM state queries)
+        │
+        └─ block files (tx · trace · receipts · events) ──→ S3 ─→ Chaintable indexing pipeline (tx/trace data)
+```
+
+---
+
 <br>
 <br>
 

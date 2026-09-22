@@ -1,0 +1,147 @@
+name: build
+
+# CI + dev images. Versioned/release images are handled by release.yml (separate file).
+# STANDARD = push-on-PR: trusted events build AND push a SHA-tagged image, so you can
+# `docker pull` the PR image and test the node before merging. Do NOT gate the push off on PR.
+#   - same-repository pull_request → build + push a SHA-tagged dev image
+#   - push to main → same
+#   - workflow_dispatch → same
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  REGISTRY: public.ecr.aws/b2h7a5c4/chaintable
+  # IMAGE_NAME is the NEUTRAL base image (usually the repo name): op-geth, reth-x, conduit-op-reth, moonbeam-x ...
+  # It is retagged to per-chain <chain>-writer aliases below. Pick a base name that is NOT a <chain>-writer.
+  IMAGE_NAME: tempo
+  # Space-separated chains this binary serves. Each gets a <chain>-writer alias (same digest).
+  # Single-chain repo: one entry, e.g. CHAINS: "ronin". Multi-chain: CHAINS: "optimism base mode ...".
+  CHAINS: "tempo"
+  DOCKERFILE: Dockerfile.debank
+
+jobs:
+  build:
+    # Same-repository PRs publish test images; fork/Dependabot PRs need a maintainer branch.
+    if: >-
+      github.repository == 'Chaintable/tempo' &&
+      (github.event_name != 'pull_request' ||
+       (github.event.pull_request.head.repo.full_name == github.repository &&
+        github.actor != 'dependabot[bot]'))
+    name: build-${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu2404-linux-x86-64-16c # Native amd64, Rust / large Go default
+            arch: amd64
+          - runner: ubuntu2204-arm64-16c       # Native arm64, Rust / large Go default
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      id-token: write        # REQUIRED — without it the OIDC role assume fails ("Could not load credentials")
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Set revision (commit SHA)
+        run: |
+          echo "SOURCE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "SOURCE_SHA_SHORT=$(git rev-parse --short=8 HEAD)" >> "$GITHUB_ENV"
+          echo "REVISION=$(git rev-parse --short=8 HEAD)" >> "$GITHUB_ENV"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@254c19bd240aabef8777f48595e9d2d7b972184b # v6.2.1
+        with:
+          # Org-level secret (visibility=all). New Chaintable repos inherit it automatically — do NOT set a repo-level one.
+          # The IAM role github-actions-ecr-public trusts repo:Chaintable/*:* and can push to public ECR.
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Public ECR
+        uses: aws-actions/amazon-ecr-login@b040164c4934333d597f3f9c67502ff28f814e9c # v2.1.6
+        with:
+          registry-type: public          # REQUIRED for public.ecr.aws (default is private ECR login → push 403)
+
+      - name: Build & Push (per-arch)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ env.DOCKERFILE }}
+          platforms: linux/${{ matrix.arch }}
+          push: true                       # push-on-PR standard: PR pushes a SHA image you can pull + test. Do NOT gate this on `!= pull_request`.
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.REVISION }}-${{ matrix.arch }}
+          cache-from: type=gha,scope=build-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=build-${{ matrix.arch }}
+          build-args: |
+            VERGEN_GIT_SHA=${{ env.SOURCE_SHA }}
+            VERGEN_GIT_SHA_SHORT=${{ env.SOURCE_SHA_SHORT }}
+          provenance: false
+          sbom: false
+
+  manifest:
+    # Same-repository PRs publish test images; fork/Dependabot PRs need a maintainer branch.
+    if: >-
+      github.repository == 'Chaintable/tempo' &&
+      (github.event_name != 'pull_request' ||
+       (github.event.pull_request.head.repo.full_name == github.repository &&
+        github.actor != 'dependabot[bot]'))
+    name: merge-manifest
+    needs: build
+    # Same-repository PRs publish the manifest and writer aliases as well.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Set revision (commit SHA)
+        run: |
+          echo "SOURCE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "SOURCE_SHA_SHORT=$(git rev-parse --short=8 HEAD)" >> "$GITHUB_ENV"
+          echo "REVISION=$(git rev-parse --short=8 HEAD)" >> "$GITHUB_ENV"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@254c19bd240aabef8777f48595e9d2d7b972184b # v6.2.1
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Public ECR
+        uses: aws-actions/amazon-ecr-login@b040164c4934333d597f3f9c67502ff28f814e9c # v2.1.6
+        with:
+          registry-type: public
+
+      - name: Merge multi-arch manifest + per-chain writer aliases
+        run: |
+          # 1) merge per-arch images into one multi-arch manifest on the base image
+          docker buildx imagetools create \
+            -t ${REGISTRY}/${IMAGE_NAME}:${REVISION} \
+            ${REGISTRY}/${IMAGE_NAME}:${REVISION}-amd64 \
+            ${REGISTRY}/${IMAGE_NAME}:${REVISION}-arm64
+          # 2) alias to per-chain writer images (same digest, multiple names).
+          #    leafage-evm / pipeline consume <chain>-writer:<rev>.
+          for c in ${CHAINS}; do
+            docker buildx imagetools create \
+              -t ${REGISTRY}/${c}-writer:${REVISION} \
+              ${REGISTRY}/${IMAGE_NAME}:${REVISION}
+          done
