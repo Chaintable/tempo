@@ -37,7 +37,7 @@ Requirements:
 ### Development Workflow
 
 1. Fork the repository
-2. Create a branch from `debank`
+2. Create a branch from `main`
 3. Make changes, focused on the pipeline layer
 4. Run local checks
 5. Open a PR

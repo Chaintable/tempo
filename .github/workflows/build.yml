@@ -4,13 +4,13 @@ name: build
 # STANDARD = push-on-PR: trusted events build AND push a SHA-tagged image, so you can
 # `docker pull` the PR image and test the node before merging. Do NOT gate the push off on PR.
 #   - same-repository pull_request → build + push a SHA-tagged dev image
-#   - push to debank / main → same (both supported during default-branch migration)
+#   - push to main → same
 #   - workflow_dispatch → same
 on:
   pull_request:
-    branches: [debank, main]
+    branches: [main]
   push:
-    branches: [debank, main]
+    branches: [main]
   workflow_dispatch:
 
 env:

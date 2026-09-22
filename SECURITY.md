@@ -29,11 +29,11 @@ on an unmodified upstream build?
 
 ### Supported Versions
 
-We provide security updates for the latest `debank` branch and recent releases.
+We provide security updates for the latest `main` branch and recent releases.
 
 | Version | Supported |
 |---------|----------|
-| debank  | ✅       |
+| main  | ✅       |
 | Latest release | ✅ |
 | older versions   | ❌ |
 
