@@ -4056,6 +4056,7 @@ dependencies = [
  "sha1",
  "tempo-evm",
  "tempo-precompiles",
+ "tempo-primitives",
  "tempo-revm",
 ]
 

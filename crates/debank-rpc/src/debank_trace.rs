@@ -147,7 +147,8 @@ pub struct DebankTransaction {
 /// A single call within a Tempo AA transaction.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct TempoCall {
-    pub to: Address,
+    /// `None` (serialized as `null`) for a CREATE call, matching Tempo's `TxKind`.
+    pub to: Option<Address>,
     pub value: U256,
     pub input: Bytes,
 }
@@ -1389,16 +1390,20 @@ mod tests {
             value: U256::ZERO,
             calls: Some(vec![
                 TempoCall {
-                    to: "0x20c0000000000000000000000000000000000000"
-                        .parse()
-                        .unwrap(),
+                    to: Some(
+                        "0x20c0000000000000000000000000000000000000"
+                            .parse()
+                            .unwrap(),
+                    ),
                     value: U256::ZERO,
                     input: Bytes::from(vec![0x09, 0x5e, 0xa7, 0xb3]),
                 },
                 TempoCall {
-                    to: "0x99979c31c9785c4391dd02c00d981b30319add8f"
-                        .parse()
-                        .unwrap(),
+                    to: Some(
+                        "0x99979c31c9785c4391dd02c00d981b30319add8f"
+                            .parse()
+                            .unwrap(),
+                    ),
                     value: U256::ZERO,
                     input: Bytes::from(vec![0xae, 0x77, 0xc2, 0x37]),
                 },

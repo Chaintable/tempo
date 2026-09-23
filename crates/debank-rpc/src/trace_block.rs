@@ -39,6 +39,7 @@ use std::{
 };
 use tempo_evm::TempoEvmConfig;
 use tempo_precompiles::storage::StorageActions;
+use tempo_primitives::transaction::Call;
 use tempo_revm::evm::TempoContext;
 
 use crate::debank_trace::*;
@@ -249,6 +250,31 @@ fn debank_transaction_target(
     recipient.or(contract_address).unwrap_or_default()
 }
 
+/// Converts AA calls to their blockfile form and picks the transaction target.
+///
+/// A CREATE call keeps `to: None` (`null`), matching Tempo's `TxKind`. Only the first call can be
+/// a CREATE, so the target is the created contract when that call deployed one; otherwise it stays
+/// zero and the real targets are in `calls`.
+fn debank_aa_calls_and_target(
+    calls: &[Call],
+    contract_address: Option<Address>,
+) -> (Vec<TempoCall>, Address) {
+    let target = calls
+        .first()
+        .filter(|call| call.to.is_create())
+        .and(contract_address)
+        .unwrap_or_default();
+    let calls = calls
+        .iter()
+        .map(|call| TempoCall {
+            to: call.to.to().copied(),
+            value: call.value,
+            input: call.input.clone(),
+        })
+        .collect();
+    (calls, target)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct EventPayloadKey {
     contract_id: Address,
@@ -271,6 +297,13 @@ impl From<&DebankEvent> for EventPayloadKey {
 fn with_event_index(mut event: DebankEvent, next_event_index: &mut usize) -> DebankEvent {
     event.idx = *next_event_index;
     *next_event_index += 1;
+    event
+}
+
+/// Inspector-only logs are not in the receipt, so they take the index of the next receipt log
+/// without consuming it. Receipt logs therefore keep `idx == logIndex`, as in reth-x.
+fn with_pending_event_index(mut event: DebankEvent, next_event_index: usize) -> DebankEvent {
+    event.idx = next_event_index;
     event
 }
 
@@ -361,7 +394,7 @@ fn reconcile_persisted_events(
         }
         for candidate in &candidates[candidate_cursor..candidate_index] {
             let event = candidate.event.clone();
-            reconciled_error_events.push(with_event_index(event, next_event_index));
+            reconciled_error_events.push(with_pending_event_index(event, *next_event_index));
         }
 
         reconciled_events.push(with_event_index(
@@ -375,7 +408,7 @@ fn reconcile_persisted_events(
     // Inspector-only trailing logs execute before handler-generated receipt suffix logs.
     for candidate in &candidates[candidate_cursor..] {
         let event = candidate.event.clone();
-        reconciled_error_events.push(with_event_index(event, next_event_index));
+        reconciled_error_events.push(with_pending_event_index(event, *next_event_index));
     }
     for mut event in persisted_events[receipt_cursor..].iter().cloned() {
         event.parent_trace_id = root_trace_id.clone();
@@ -517,9 +550,9 @@ where
             let tx = &block_txs[index];
             let receipt = &receipts[index];
 
-            // Extract 0x76 AA tx fields from serde JSON.
+            // Extract 0x76 AA tx fields from serde JSON; calls come from the typed transaction.
             let tx_json = serde_json::to_value(tx).unwrap_or_default();
-            let is_aa = tx_json.get("type").and_then(|t| t.as_str()) == Some("0x76");
+            let aa_tx = tx.as_aa();
 
             let parse_hex_u64 = |v: &serde_json::Value| -> Option<u64> {
                 v.as_str()
@@ -543,16 +576,16 @@ where
                 ..Default::default()
             };
 
-            if is_aa {
+            if let Some(aa_tx) = aa_tx {
                 // AA tx has no top-level to/input/value; real data is in calls.
                 // Clear the degraded values filled by trait methods from calls[0].
-                dtx.to = Address::ZERO;
+                let (calls, target) =
+                    debank_aa_calls_and_target(&aa_tx.tx().calls, receipt.contract_address());
+                dtx.to = target;
                 dtx.input = Default::default();
                 dtx.value = U256::ZERO;
                 dtx.chain_id = tx_json.get("chainId").and_then(&parse_hex_u64);
-                dtx.calls = tx_json
-                    .get("calls")
-                    .and_then(|v| serde_json::from_value(v.clone()).ok());
+                dtx.calls = Some(calls);
                 dtx.fee_token = tx_json
                     .get("feeToken")
                     .and_then(|v| v.as_str())
@@ -875,32 +908,9 @@ where
             }
         }
 
-        // Reassign event idx to ensure block-global continuity (no gaps).
-        // build_debank_traces always increments log_index (needed for AA tx),
-        // but classification may split events between events/error_events,
-        // leaving gaps in idx. Sort by current idx (preserves original
-        // per-block order) and reassign [0, 1, 2, ...] sequentially.
-        let mut idx_map: Vec<(usize, bool, usize)> = block_file
-            .events
-            .iter()
-            .enumerate()
-            .map(|(pos, e)| (e.idx, false, pos))
-            .chain(
-                block_file
-                    .error_events
-                    .iter()
-                    .enumerate()
-                    .map(|(pos, e)| (e.idx, true, pos)),
-            )
-            .collect();
-        idx_map.sort_by_key(|(old_idx, _, _)| *old_idx);
-        for (new_idx, (_, is_error, pos)) in idx_map.into_iter().enumerate() {
-            if is_error {
-                block_file.error_events[pos].idx = new_idx;
-            } else {
-                block_file.events[pos].idx = new_idx;
-            }
-        }
+        // Event idx values are final: reconcile_persisted_events numbered receipt logs with their
+        // block-level logIndex (including failed-tx handler logs) and gave inspector-only logs the
+        // next receipt index without consuming it.
 
         let mut state_diff = state_diff;
         state_diff.hash = block_state_root;
@@ -1114,8 +1124,9 @@ mod tests {
         assert_eq!(error_events[0].idx, 2);
         assert_eq!(
             events.iter().map(|event| event.idx).collect::<Vec<_>>(),
-            vec![0, 1, 3, 4]
+            vec![0, 1, 2, 3]
         );
+        assert_eq!(next_event_index, 4);
         assert_eq!(events[0].parent_trace_id, "root");
         assert_eq!(events[0].pos_in_parent_trace, 2);
         assert_eq!(events[1].parent_trace_id, "child");
@@ -1161,5 +1172,93 @@ mod tests {
         assert_eq!(events[0].parent_trace_id, "successful-child");
         assert_eq!(error_events.len(), 1);
         assert_eq!(error_events[0].parent_trace_id, "reverted-child");
+    }
+
+    #[test]
+    fn event_idx_follows_block_log_index_across_failed_and_successful_txs() {
+        fn event(marker: u8, parent_trace_id: &str) -> DebankEvent {
+            DebankEvent {
+                contract_id: Address::repeat_byte(marker),
+                selector: format!("0x{marker:02x}"),
+                parent_trace_id: parent_trace_id.to_string(),
+                ..Default::default()
+            }
+        }
+        let root = DebankTrace {
+            id: "root".to_string(),
+            ..Default::default()
+        };
+        let mut next_event_index = 0;
+
+        // Failed tx: a log emitted before the revert is not in the receipt, while the handler's
+        // fee log is persisted and occupies logIndex 0.
+        let (failed_receipt_events, failed_reverted_events) = reconcile_persisted_events(
+            Vec::new(),
+            vec![event(0xee, "reverted")],
+            vec![event(0xfe, "")],
+            Some(&root),
+            false,
+            &mut next_event_index,
+        );
+        // Successful tx: both logs are persisted and follow the failed tx's fee log.
+        let (success_events, success_reverted_events) = reconcile_persisted_events(
+            vec![event(0xa0, "child"), event(0xb0, "child")],
+            Vec::new(),
+            vec![event(0xa0, ""), event(0xb0, "")],
+            Some(&root),
+            false,
+            &mut next_event_index,
+        );
+
+        assert_eq!(failed_receipt_events.len(), 1);
+        assert_eq!(failed_receipt_events[0].selector, "0xfe");
+        assert_eq!(failed_receipt_events[0].idx, 0);
+        assert_eq!(failed_reverted_events.len(), 1);
+        assert_eq!(failed_reverted_events[0].idx, 0);
+        assert!(success_reverted_events.is_empty());
+        assert_eq!(
+            success_events
+                .iter()
+                .map(|event| (event.selector.as_str(), event.idx))
+                .collect::<Vec<_>>(),
+            vec![("0xa0", 1), ("0xb0", 2)]
+        );
+        assert_eq!(next_event_index, 3);
+    }
+
+    #[test]
+    fn aa_calls_keep_create_target_as_null() {
+        let created = Address::repeat_byte(0x71);
+        let callee = Address::repeat_byte(0x20);
+        let calls = vec![
+            Call {
+                to: alloy_primitives::TxKind::Create,
+                value: U256::ZERO,
+                input: vec![0x60, 0x80].into(),
+            },
+            Call {
+                to: alloy_primitives::TxKind::Call(callee),
+                value: U256::from(1),
+                input: vec![0x01].into(),
+            },
+        ];
+
+        let (debank_calls, target) = debank_aa_calls_and_target(&calls, Some(created));
+        assert_eq!(target, created);
+        assert_eq!(debank_calls[0].to, None);
+        assert_eq!(debank_calls[0].input, calls[0].input);
+        assert_eq!(debank_calls[1].to, Some(callee));
+        assert_eq!(debank_calls[1].value, U256::from(1));
+        let json = serde_json::to_value(&debank_calls).unwrap();
+        assert_eq!(json[0]["to"], serde_json::Value::Null);
+
+        // A reverted CREATE has no receipt contract address.
+        let (_, target) = debank_aa_calls_and_target(&calls, None);
+        assert_eq!(target, Address::ZERO);
+
+        // Plain calls keep the AA rule of a zero top-level target.
+        let (debank_calls, target) = debank_aa_calls_and_target(&calls[1..], None);
+        assert_eq!(target, Address::ZERO);
+        assert_eq!(debank_calls[0].to, Some(callee));
     }
 }
