@@ -1,10 +1,6 @@
 //! Tempo EVM Handler implementation.
 
-use std::{
-    cmp::Ordering,
-    fmt::Debug,
-    sync::{Arc, OnceLock},
-};
+use std::{cmp::Ordering, fmt::Debug, sync::Arc};
 
 use alloy_primitives::{Address, U256};
 use reth_evm::{EvmError, EvmInternals};
@@ -1510,20 +1506,16 @@ where
                 u64::MAX
             };
 
-            // Create gas_params with only sstore increase for key authorization
+            // Only charge SSTORE creation and warm storage reads for T1+ key authorization.
+            // Use this transaction's gas params: a process-wide cache would make historical
+            // execution depend on which fork's authorization ran first.
             let gas_params = if spec.is_t1() {
-                static TABLE: OnceLock<GasParams> = OnceLock::new();
-                // only enabled SSTORE and warm storage read gas params for T1 fork in keychain.
-                TABLE
-                    .get_or_init(|| {
-                        let mut table = [0u64; 256];
-                        table[GasId::sstore_set_without_load_cost().as_usize()] =
-                            cfg.gas_params.get(GasId::sstore_set_without_load_cost());
-                        table[GasId::warm_storage_read_cost().as_usize()] =
-                            cfg.gas_params.get(GasId::warm_storage_read_cost());
-                        GasParams::new(Arc::new(table))
-                    })
-                    .clone()
+                let mut table = [0u64; 256];
+                table[GasId::sstore_set_without_load_cost().as_usize()] =
+                    cfg.gas_params.get(GasId::sstore_set_without_load_cost());
+                table[GasId::warm_storage_read_cost().as_usize()] =
+                    cfg.gas_params.get(GasId::warm_storage_read_cost());
+                GasParams::new(Arc::new(table))
             } else {
                 cfg.gas_params.clone()
             };

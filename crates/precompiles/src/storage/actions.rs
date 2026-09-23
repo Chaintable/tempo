@@ -62,6 +62,11 @@ impl StorageAction {
             Self::FeeAmmSwap(..) | Self::FeeAmmLiquidityCheck(..) => TIP_FEE_MANAGER_ADDRESS,
         }
     }
+
+    /// Returns whether this action writes persistent storage.
+    pub const fn writes_storage(&self) -> bool {
+        !matches!(self, Self::Sload(..) | Self::FeeAmmLiquidityCheck(..))
+    }
 }
 
 /// Buffer for recording EVM [storage actions](StorageAction).
@@ -131,6 +136,26 @@ impl StorageActions {
             Self::Enabled(state) => {
                 Some(std::mem::replace(&mut state.borrow_mut().actions, actions))
             }
+        }
+    }
+
+    /// Returns an opaque position in the current action buffer.
+    pub fn cursor(&self) -> usize {
+        match self {
+            Self::Disabled => 0,
+            Self::Enabled(state) => state.borrow().actions.len(),
+        }
+    }
+
+    /// Returns whether persistent storage was written after `cursor`.
+    pub fn has_storage_write_since(&self, cursor: usize) -> bool {
+        match self {
+            Self::Disabled => false,
+            Self::Enabled(state) => state
+                .borrow()
+                .actions
+                .get(cursor..)
+                .is_some_and(|actions| actions.iter().any(StorageAction::writes_storage)),
         }
     }
 
@@ -327,5 +352,26 @@ mod tests {
                 StorageAction::Sstore(address, key, U256::from(1), U256::from(8)),
             ])
         );
+    }
+
+    #[test]
+    fn storage_write_detection_uses_action_cursor() {
+        let actions = StorageActions::enabled();
+        let address = Address::repeat_byte(0x42);
+        let key = U256::from(7);
+
+        actions.record(StorageAction::Sstore(address, key, U256::ZERO, U256::ONE));
+        let cursor = actions.cursor();
+        actions.record(StorageAction::Sload(address, key, U256::ONE));
+        actions.record(StorageAction::FeeAmmLiquidityCheck(
+            key,
+            U256::ONE,
+            U256::ONE,
+            true,
+        ));
+        assert!(!actions.has_storage_write_since(cursor));
+
+        actions.record(StorageAction::Sinc(address, key, U256::ONE, U256::ONE));
+        assert!(actions.has_storage_write_since(cursor));
     }
 }
