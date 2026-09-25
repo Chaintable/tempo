@@ -7,8 +7,10 @@ use reth_rpc_eth_api::{EthApiTypes, helpers::EthCall};
 use reth_rpc_eth_types::EthApiError;
 use revm::context::result::ExecutionResult;
 
-use crate::erc20_handle::{NATIVE_TOKEN_ADDRESS, eth_erc20_handle};
-use crate::types::{MultiCallErrorCode, MultiCallResp, MultiCallStats, SingleCallResult};
+use crate::{
+    erc20_handle::{NATIVE_TOKEN_ADDRESS, eth_erc20_handle},
+    types::{MultiCallErrorCode, MultiCallResp, MultiCallStats, SingleCallResult},
+};
 
 /// `eth_multiCall` API implementation.
 #[derive(Clone)]
