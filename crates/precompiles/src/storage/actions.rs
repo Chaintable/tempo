@@ -147,15 +147,19 @@ impl StorageActions {
         }
     }
 
-    /// Returns whether persistent storage was written after `cursor`.
-    pub fn has_storage_write_since(&self, cursor: usize) -> bool {
+    /// Returns the accounts whose persistent storage was written after `cursor`, in record order.
+    pub fn storage_writes_since(&self, cursor: usize) -> Vec<Address> {
         match self {
-            Self::Disabled => false,
+            Self::Disabled => Vec::new(),
             Self::Enabled(state) => state
                 .borrow()
                 .actions
                 .get(cursor..)
-                .is_some_and(|actions| actions.iter().any(StorageAction::writes_storage)),
+                .unwrap_or_default()
+                .iter()
+                .filter(|action| action.writes_storage())
+                .map(StorageAction::address)
+                .collect(),
         }
     }
 
@@ -369,9 +373,9 @@ mod tests {
             U256::ONE,
             true,
         ));
-        assert!(!actions.has_storage_write_since(cursor));
+        assert!(actions.storage_writes_since(cursor).is_empty());
 
         actions.record(StorageAction::Sinc(address, key, U256::ONE, U256::ONE));
-        assert!(actions.has_storage_write_since(cursor));
+        assert_eq!(actions.storage_writes_since(cursor), vec![address]);
     }
 }

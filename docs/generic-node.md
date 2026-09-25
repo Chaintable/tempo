@@ -154,11 +154,19 @@ Revert tx: `ExecutionResult::Revert` 没有 logs 字段。handler 的 fee log �
 
 ### per-trace storage_change 对预编译无效 (CTO CR #7, 已修复)
 
-`debank_trace.rs` 中 `self_storage_change` 通过检测 SSTORE opcode 设置。Tempo 自定义预编译（TIP-20、FeeManager 等）的 storage 修改直接在 Rust 代码中操作 state，不走 SSTORE opcode，只靠 opcode 检测时调用预编译的 trace `storage_change=false`。
+字段语义按写入本身判定，不只看 opcode：
+- `self_storage_change`：本调用写了自己的 storage。
+- `storage_change`：本调用写了任何账户的 storage，或者有成功的子调用 `storage_change=true`；失败子调用的写入已回滚，不向上传播。
 
-**修复**: `trace_block.rs` 的 `NativeStorageChangeInspector` 对预编译调用检查 journal 的 `StorageChanged` 和 storage action 写入，结果合并进 trace 并向父调用传播。预编译用 `TempoAddressExt::is_precompile(spec)` 判定（TIP-20 前缀 + 当前 hardfork 已激活的系统预编译，与 `extend_tempo_precompiles` 的 lookup 列表一致）。journal 的 `precompile_addresses()` 只包含 `warm_addresses()` 里的标准预编译（见上节 CR #1），不能单独用来识别 Tempo 预编译。
+EVM 合约代码只能用 SSTORE 写当前执行上下文的 storage，`debank_trace.rs` 按 SSTORE opcode 置位即符合上述语义，与 geth pipeline 实现一致。Tempo 自定义预编译（TIP-20、FeeManager 等）用 Rust 代码直接写 state，不执行 SSTORE，只看 opcode 时调用预编译的 trace 两个字段都是 false，并导致父调用的 `storage_change` 也为 false。
 
-block 级 `storage_contracts`（从 `diff.cache` 提取）不受影响，一直能正确反映所有 storage 变化的合约地址。
+**修复**: `trace_block.rs` 的 `NativeStorageChangeInspector` 对预编译调用收集 journal 的 `StorageChanged` 与 storage action 中的写入地址；调用 revert 后 journal 条目会回滚，但 storage action 仍保留，与 revert 前执行过 SSTORE 的处理一致：
+- 写入地址等于调用地址时置 `self_storage_change`。Tempo 预编译只接受直接调用，调用地址就是它的 storage 所在账户。
+- 有任何写入时置 `storage_change`。预编译可以在 Rust 里直接写其他账户，例如 `TIP20Factory.createToken` 初始化新 token、FeeManager `distribute_fees` 修改 token 余额；这类写入只体现在 `storage_change`，所以不能用 `self_storage_change` + `to_addr` 推出完整的写入账户集合。
+
+预编译用 `TempoAddressExt::is_precompile(spec)` 判定（TIP-20 前缀 + 当前 hardfork 已激活的系统预编译，与 `extend_tempo_precompiles` 的 lookup 列表一致）。journal 的 `precompile_addresses()` 只包含 `PrecompilesMap::warm_addresses()` 中静态注册的标准预编译，不能用来识别 Tempo 预编译。
+
+block 级 `storage_contracts` 由 `get_storage_contracts_from_bundle` 从回放后的 bundle state 计算，不依赖这两个字段；它只包含已提交的 storage 变更，不包含只在失败调用中写过的账户。
 
 ### event idx 连续性保证 (CTO 新增关注, 已修复)
 

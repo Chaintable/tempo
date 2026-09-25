@@ -62,7 +62,7 @@ struct NativeCallFrame {
 #[derive(Debug)]
 struct NativeStorageChangeInspector {
     frames: Vec<NativeCallFrame>,
-    changes: Vec<(Address, bool)>,
+    changes: Vec<(Address, NativeStorageWrites)>,
     actions: StorageActions,
 }
 
@@ -88,7 +88,7 @@ impl NativeStorageChangeInspector {
         is_precompile: bool,
     ) {
         let change_index = self.changes.len();
-        self.changes.push((address, false));
+        self.changes.push((address, NativeStorageWrites::default()));
         self.frames.push(NativeCallFrame {
             change_index,
             journal_start: context.journaled_state.journal.len(),
@@ -105,20 +105,28 @@ impl NativeStorageChangeInspector {
             return;
         }
 
-        let journal_storage_changed = context
+        // Tempo precompiles only accept direct calls, so the frame address is the account whose
+        // storage the precompile owns. Storage actions survive a journal revert, so writes of a
+        // failed call are still attributed, like an SSTORE executed before a revert.
+        let (frame_address, writes) = &mut self.changes[frame.change_index];
+        let journal_writes = context
             .journaled_state
             .journal
             .get(frame.journal_start..)
-            .is_some_and(|entries| {
-                entries
-                    .iter()
-                    .any(|entry| matches!(entry, JournalEntry::StorageChanged { .. }))
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|entry| match entry {
+                JournalEntry::StorageChanged { address, .. } => Some(*address),
+                _ => None,
             });
-        self.changes[frame.change_index].1 =
-            journal_storage_changed || self.actions.has_storage_write_since(frame.action_cursor);
+        for written in journal_writes.chain(self.actions.storage_writes_since(frame.action_cursor))
+        {
+            writes.any = true;
+            writes.own |= written == *frame_address;
+        }
     }
 
-    fn into_changes(self) -> Vec<(Address, bool)> {
+    fn into_changes(self) -> Vec<(Address, NativeStorageWrites)> {
         self.changes
     }
 }
@@ -202,9 +210,9 @@ fn new_debank_inspector(actions: StorageActions) -> DebankInspector {
 /// match for every real call/create frame.
 fn align_native_storage_changes(
     arena: &mut CallTraceArena,
-    native_changes: Vec<(Address, bool)>,
+    native_changes: Vec<(Address, NativeStorageWrites)>,
     tx_success: bool,
-) -> Option<Vec<(Address, bool)>> {
+) -> Option<Vec<(Address, NativeStorageWrites)>> {
     let nodes = arena.nodes();
     let trace_node_count = nodes.len();
     if trace_node_count == native_changes.len()
@@ -235,7 +243,7 @@ fn align_native_storage_changes(
 
     arena.nodes_mut()[0].trace.success = tx_success;
     let mut aligned = Vec::with_capacity(trace_node_count);
-    aligned.push((Address::ZERO, false));
+    aligned.push((Address::ZERO, NativeStorageWrites::default()));
     aligned.extend(native_changes);
     Some(aligned)
 }
@@ -983,6 +991,11 @@ mod tests {
     use tempo_precompiles::storage::StorageAction;
     use tempo_revm::TempoTxEnv;
 
+    const OWN_WRITE: NativeStorageWrites = NativeStorageWrites {
+        own: true,
+        any: true,
+    };
+
     #[test]
     fn native_inspector_attributes_journaled_storage_to_precompile_frame() {
         let root = Address::repeat_byte(0x11);
@@ -1006,7 +1019,51 @@ mod tests {
 
         assert_eq!(
             inspector.into_changes(),
-            vec![(root, false), (precompile, true)]
+            vec![
+                (root, NativeStorageWrites::default()),
+                (precompile, OWN_WRITE)
+            ]
+        );
+    }
+
+    #[test]
+    fn native_inspector_separates_writes_to_other_accounts() {
+        let precompile = Address::repeat_byte(0x22);
+        let other = Address::repeat_byte(0x33);
+        let actions = StorageActions::enabled();
+        let mut context: TempoContext<_> = Context::mainnet()
+            .with_db(CacheDB::new(EmptyDB::default()))
+            .with_block(TempoBlockEnv::default())
+            .with_cfg(Default::default())
+            .with_tx(TempoTxEnv::default());
+        let mut inspector = NativeStorageChangeInspector::new(actions.clone());
+
+        // Journaled write to another account, e.g. TIP20Factory initializing a new token.
+        inspector.start_frame(&context, precompile, true);
+        context.journal_mut().load_account(other).unwrap();
+        context
+            .journal_mut()
+            .sstore(other, U256::ZERO, U256::from(1))
+            .unwrap();
+        inspector.finish_frame(&context);
+
+        // Reverted write to another account, only visible through storage actions.
+        inspector.start_frame(&context, precompile, true);
+        actions.record(StorageAction::Sstore(
+            other,
+            U256::ZERO,
+            U256::ZERO,
+            U256::ONE,
+        ));
+        inspector.finish_frame(&context);
+
+        let other_only = NativeStorageWrites {
+            own: false,
+            any: true,
+        };
+        assert_eq!(
+            inspector.into_changes(),
+            vec![(precompile, other_only), (precompile, other_only)]
         );
     }
 
@@ -1032,7 +1089,7 @@ mod tests {
         assert!(context.journaled_state.journal.is_empty());
         inspector.finish_frame(&context);
 
-        assert_eq!(inspector.into_changes(), vec![(precompile, true)]);
+        assert_eq!(inspector.into_changes(), vec![(precompile, OWN_WRITE)]);
     }
 
     #[test]
@@ -1053,7 +1110,7 @@ mod tests {
 
         let sender = Address::repeat_byte(0x01);
         let recipient = Address::repeat_byte(0x02);
-        let spec = TempoHardfork::latest();
+        let spec = TempoHardfork::T11;
         let mut evm = TempoEvm::new(
             CacheDB::new(EmptyDB::default()),
             EvmEnv::new(
@@ -1096,8 +1153,27 @@ mod tests {
             .unwrap();
         assert!(result.result.is_success(), "{:?}", result.result);
 
-        let native = mem::take(&mut evm.components_mut().1.1);
-        assert_eq!(native.into_changes(), vec![(PATH_USD_ADDRESS, true)]);
+        let (inspector, native) = mem::replace(
+            evm.components_mut().1,
+            new_debank_inspector(StorageActions::disabled()),
+        );
+        // The token writes its own balances.
+        let native_changes = native.into_changes();
+        assert_eq!(native_changes, vec![(PATH_USD_ADDRESS, OWN_WRITE)]);
+
+        let mut arena = inspector.into_traces();
+        let native_changes =
+            align_native_storage_changes(&mut arena, native_changes, true).unwrap();
+        let (traces, error_traces, _, _) = build_debank_traces(
+            B256::ZERO,
+            arena,
+            &native_changes,
+            &std::cell::RefCell::new(0),
+        );
+        assert!(error_traces.is_empty());
+        assert_eq!(traces.len(), 1);
+        assert!(traces[0].self_storage_change);
+        assert!(traces[0].storage_change);
     }
 
     #[test]
@@ -1131,14 +1207,20 @@ mod tests {
         let mut invalid_arena = arena.clone();
         invalid_arena.nodes_mut()[0].trace.address = Address::repeat_byte(0x11);
         assert!(
-            align_native_storage_changes(&mut invalid_arena, vec![(precompile, true)], true,)
+            align_native_storage_changes(&mut invalid_arena, vec![(precompile, OWN_WRITE)], true,)
                 .is_none()
         );
 
         let aligned =
-            align_native_storage_changes(&mut arena, vec![(precompile, true)], true).unwrap();
+            align_native_storage_changes(&mut arena, vec![(precompile, OWN_WRITE)], true).unwrap();
         assert!(arena.nodes()[0].trace.success);
-        assert_eq!(aligned, vec![(Address::ZERO, false), (precompile, true)]);
+        assert_eq!(
+            aligned,
+            vec![
+                (Address::ZERO, NativeStorageWrites::default()),
+                (precompile, OWN_WRITE)
+            ]
+        );
     }
 
     #[test]
