@@ -12,7 +12,7 @@
 
 从 Chaintable `main=c7230be79608d9d0965c85c18723f0a5f3b79481` 合入上游 `v1.15.0=464e51994b541b37cb875d47747e38bb67e3692a`。当前 main 已包含 [PR #10](https://github.com/Chaintable/tempo/pull/10)、[#12](https://github.com/Chaintable/tempo/pull/12)、[#13](https://github.com/Chaintable/tempo/pull/13) 的 writer/RPC 改动。冲突涉及 20 个 GitHub workflow、根 Cargo.toml 和 Cargo.lock；没有需要人工选择业务语义的冲突。
 
-保留的 fork patch 是 `debank-rpc` crate 和其 node 注册、EVM trace/state-diff hook，供 `trace_debankBlock`、`eth_multiCall`、`pre_traceMany` 及 writer 下游消费；保留 Rust 1.96 构建设置及 Chaintable 的公共 ECR 构建和发布 workflow。Cargo.lock 以上游 v1.15.0 为基底，仅补 `debank-rpc`、`md-5 0.10.6` 和 `tempo-node` 对前者的依赖。自动合并的 EVM、node、handler 路径已由编译、单测和主网 RPC 对账覆盖。
+保留的 fork patch 是 `debank-rpc` crate、node 注册和 EVM storage action 访问入口，供 `trace_debankBlock`、`eth_multiCall`、`pre_traceMany` 及 writer 下游消费；storage action 的写入检测用于完整捕获嵌套调用的状态变化。`handler.rs` 保留逐交易构造 T1+ key authorization gas 参数的修复，避免跨 fork 的进程级缓存影响历史执行。另保留 Rust 1.96 构建设置及 Chaintable 的公共 ECR 构建和发布 workflow。Cargo.lock 以上游 v1.15.0 为基底，仅补 `debank-rpc`、`md-5 0.10.6` 和 `tempo-node` 对前者的依赖。自动合并的 EVM、node、handler 路径已由编译、单测和主网 RPC 对账覆盖。
 
 ## 3. 部署情况
 
