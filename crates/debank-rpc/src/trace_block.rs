@@ -39,7 +39,7 @@ use std::{
 };
 use tempo_evm::TempoEvmConfig;
 use tempo_precompiles::storage::StorageActions;
-use tempo_primitives::transaction::Call;
+use tempo_primitives::{TempoAddressExt, transaction::Call};
 use tempo_revm::evm::TempoContext;
 
 use crate::debank_trace::*;
@@ -133,10 +133,13 @@ impl<DB: Database> Inspector<TempoContext<DB>> for NativeStorageChangeInspector 
             CallScheme::DelegateCall | CallScheme::CallCode => inputs.bytecode_address,
             _ => inputs.target_address,
         };
-        let is_precompile = context
-            .journal_ref()
-            .precompile_addresses()
-            .contains(&address);
+        // Tempo precompiles are served through the precompile lookup and are not part of the
+        // journal's warm precompile set, which only holds the static Ethereum precompiles.
+        let is_precompile = address.is_precompile(context.cfg.spec)
+            || context
+                .journal_ref()
+                .precompile_addresses()
+                .contains(&address);
         self.start_frame(context, address, is_precompile);
         None
     }
@@ -1030,6 +1033,71 @@ mod tests {
         inspector.finish_frame(&context);
 
         assert_eq!(inspector.into_changes(), vec![(precompile, true)]);
+    }
+
+    #[test]
+    fn debank_inspector_marks_tip20_transfer_storage_change() {
+        use alloy_sol_types::SolCall;
+        use reth_evm::EvmEnv;
+        use revm::{
+            DatabaseCommit,
+            context::{CfgEnv, TxEnv},
+            primitives::TxKind,
+        };
+        use tempo_chainspec::hardfork::TempoHardfork;
+        use tempo_evm::evm::TempoEvm;
+        use tempo_precompiles::{
+            PATH_USD_ADDRESS, storage::StorageCtx, test_util::TIP20Setup, tip20::ITIP20,
+        };
+        use tempo_revm::gas_params::tempo_gas_params;
+
+        let sender = Address::repeat_byte(0x01);
+        let recipient = Address::repeat_byte(0x02);
+        let spec = TempoHardfork::latest();
+        let mut evm = TempoEvm::new(
+            CacheDB::new(EmptyDB::default()),
+            EvmEnv::new(
+                CfgEnv::new_with_spec_and_gas_params(spec, tempo_gas_params(spec)),
+                TempoBlockEnv::default(),
+            ),
+        );
+        StorageCtx::enter_ctx(evm.ctx_mut(), StorageActions::disabled(), || {
+            TIP20Setup::path_usd(sender)
+                .with_issuer(sender)
+                .with_mint(sender, U256::from(1_000_000))
+                .apply()
+        })
+        .unwrap();
+        let setup_state = evm.ctx_mut().journaled_state.finalize();
+        evm.db_mut().commit(setup_state);
+
+        // Same wiring as trace_debankBlock: TIP-20 tokens are served through the precompile
+        // lookup, so they must be classified as precompiles by `Inspector::call`.
+        let evm = evm.with_actions();
+        let storage_actions = evm.storage_actions();
+        let mut evm = evm.with_inspector(new_debank_inspector(storage_actions));
+        let result = evm
+            .transact(TempoTxEnv {
+                inner: TxEnv {
+                    caller: sender,
+                    gas_limit: 1_000_000,
+                    kind: TxKind::Call(PATH_USD_ADDRESS),
+                    data: ITIP20::transferCall {
+                        to: recipient,
+                        amount: U256::from(100),
+                    }
+                    .abi_encode()
+                    .into(),
+                    ..Default::default()
+                },
+                fee_token: Some(PATH_USD_ADDRESS),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(result.result.is_success(), "{:?}", result.result);
+
+        let native = mem::take(&mut evm.components_mut().1.1);
+        assert_eq!(native.into_changes(), vec![(PATH_USD_ADDRESS, true)]);
     }
 
     #[test]

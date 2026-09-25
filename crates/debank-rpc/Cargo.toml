@@ -61,3 +61,5 @@ futures = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+tempo-chainspec.workspace = true
+tempo-precompiles = { workspace = true, features = ["test-utils"] }

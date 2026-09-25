@@ -152,13 +152,13 @@ Revert tx: `ExecutionResult::Revert` 没有 logs 字段。handler 的 fee log �
 
 `trace_block.rs` 设为 `true`，排除标准预编译 (0x01-0x09) 的 call trace。CTO 初始认为会丢失 Tempo 自定义预编译 trace，**经确认：Tempo 自定义预编译 (TIP-20, FeeManager 等) 通过 `set_precompile_lookup` 注册，其地址不在 `warm_addresses()` 中，不受 `exclude_precompile_calls` 影响**。无需修改。
 
-### per-trace storage_change 对预编译无效 (CTO CR #7)
+### per-trace storage_change 对预编译无效 (CTO CR #7, 已修复)
 
-`debank_trace.rs` 中 `self_storage_change` 通过检测 SSTORE opcode 设置。Tempo 自定义预编译（TIP-20、FeeManager 等）的 storage 修改直接在 Rust 代码中操作 state，不走 SSTORE opcode，因此调用预编译的 trace `storage_change=false`，即使预编译实际修改了 storage slot。
+`debank_trace.rs` 中 `self_storage_change` 通过检测 SSTORE opcode 设置。Tempo 自定义预编译（TIP-20、FeeManager 等）的 storage 修改直接在 Rust 代码中操作 state，不走 SSTORE opcode，只靠 opcode 检测时调用预编译的 trace `storage_change=false`。
 
-block 级 `storage_contracts`（从 `diff.cache` 提取）不受影响，能正确反映所有 storage 变化的合约地址。仅 per-trace 级信号对预编译调用无效。
+**修复**: `trace_block.rs` 的 `NativeStorageChangeInspector` 对预编译调用检查 journal 的 `StorageChanged` 和 storage action 写入，结果合并进 trace 并向父调用传播。预编译用 `TempoAddressExt::is_precompile(spec)` 判定（TIP-20 前缀 + 当前 hardfork 已激活的系统预编译，与 `extend_tempo_precompiles` 的 lookup 列表一致）。journal 的 `precompile_addresses()` 只包含 `warm_addresses()` 里的标准预编译（见上节 CR #1），不能单独用来识别 Tempo 预编译。
 
-**已知限制**，与 reth-x 行为一致（reth-x 标准预编译同样不走 SSTORE）。
+block 级 `storage_contracts`（从 `diff.cache` 提取）不受影响，一直能正确反映所有 storage 变化的合约地址。
 
 ### event idx 连续性保证 (CTO 新增关注, 已修复)
 
