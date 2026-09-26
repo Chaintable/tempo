@@ -39,7 +39,7 @@ use std::{
 };
 use tempo_evm::TempoEvmConfig;
 use tempo_precompiles::storage::StorageActions;
-use tempo_primitives::{TempoAddressExt, transaction::Call};
+use tempo_primitives::transaction::Call;
 use tempo_revm::evm::TempoContext;
 
 use crate::debank_trace::*;
@@ -51,7 +51,6 @@ struct NativeCallFrame {
     change_index: usize,
     journal_start: usize,
     action_cursor: usize,
-    is_precompile: bool,
 }
 
 /// Records storage writes performed inside native precompile frames.
@@ -81,27 +80,21 @@ impl NativeStorageChangeInspector {
         }
     }
 
-    fn start_frame<DB: Database>(
-        &mut self,
-        context: &TempoContext<DB>,
-        address: Address,
-        is_precompile: bool,
-    ) {
+    fn start_frame<DB: Database>(&mut self, context: &TempoContext<DB>, address: Address) {
         let change_index = self.changes.len();
         self.changes.push((address, NativeStorageWrites::default()));
         self.frames.push(NativeCallFrame {
             change_index,
             journal_start: context.journaled_state.journal.len(),
             action_cursor: self.actions.cursor(),
-            is_precompile,
         });
     }
 
-    fn finish_frame<DB: Database>(&mut self, context: &TempoContext<DB>) {
+    fn finish_frame<DB: Database>(&mut self, context: &TempoContext<DB>, is_precompile: bool) {
         let Some(frame) = self.frames.pop() else {
             return;
         };
-        if !frame.is_precompile {
+        if !is_precompile {
             return;
         }
 
@@ -141,14 +134,7 @@ impl<DB: Database> Inspector<TempoContext<DB>> for NativeStorageChangeInspector 
             CallScheme::DelegateCall | CallScheme::CallCode => inputs.bytecode_address,
             _ => inputs.target_address,
         };
-        // Tempo precompiles are served through the precompile lookup and are not part of the
-        // journal's warm precompile set, which only holds the static Ethereum precompiles.
-        let is_precompile = address.is_precompile(context.cfg.spec)
-            || context
-                .journal_ref()
-                .precompile_addresses()
-                .contains(&address);
-        self.start_frame(context, address, is_precompile);
+        self.start_frame(context, address);
         None
     }
 
@@ -156,9 +142,12 @@ impl<DB: Database> Inspector<TempoContext<DB>> for NativeStorageChangeInspector 
         &mut self,
         context: &mut TempoContext<DB>,
         _inputs: &CallInputs,
-        _outcome: &mut CallOutcome,
+        outcome: &mut CallOutcome,
     ) {
-        self.finish_frame(context);
+        // revm sets this when a precompile served the call, including the Tempo precompiles
+        // registered through the precompile lookup. The journal's warm precompile set only holds
+        // the statically registered Ethereum precompiles and cannot identify them.
+        self.finish_frame(context, outcome.was_precompile_called);
     }
 
     fn create(
@@ -174,7 +163,7 @@ impl<DB: Database> Inspector<TempoContext<DB>> for NativeStorageChangeInspector 
             .ok()?
             .info
             .nonce;
-        self.start_frame(context, inputs.created_address(nonce), false);
+        self.start_frame(context, inputs.created_address(nonce));
         None
     }
 
@@ -184,7 +173,7 @@ impl<DB: Database> Inspector<TempoContext<DB>> for NativeStorageChangeInspector 
         _inputs: &CreateInputs,
         _outcome: &mut CreateOutcome,
     ) {
-        self.finish_frame(context);
+        self.finish_frame(context, false);
     }
 }
 
@@ -1007,15 +996,15 @@ mod tests {
             .with_tx(TempoTxEnv::default());
         let mut inspector = NativeStorageChangeInspector::default();
 
-        inspector.start_frame(&context, root, false);
-        inspector.start_frame(&context, precompile, true);
+        inspector.start_frame(&context, root);
+        inspector.start_frame(&context, precompile);
         context.journal_mut().load_account(precompile).unwrap();
         context
             .journal_mut()
             .sstore(precompile, U256::ZERO, U256::from(1))
             .unwrap();
-        inspector.finish_frame(&context);
-        inspector.finish_frame(&context);
+        inspector.finish_frame(&context, true);
+        inspector.finish_frame(&context, false);
 
         assert_eq!(
             inspector.into_changes(),
@@ -1039,23 +1028,24 @@ mod tests {
         let mut inspector = NativeStorageChangeInspector::new(actions.clone());
 
         // Journaled write to another account, e.g. TIP20Factory initializing a new token.
-        inspector.start_frame(&context, precompile, true);
+        inspector.start_frame(&context, precompile);
         context.journal_mut().load_account(other).unwrap();
         context
             .journal_mut()
             .sstore(other, U256::ZERO, U256::from(1))
             .unwrap();
-        inspector.finish_frame(&context);
+        inspector.finish_frame(&context, true);
 
-        // Reverted write to another account, only visible through storage actions.
-        inspector.start_frame(&context, precompile, true);
+        // Write to another account whose journal entry is gone, as after a revert: only the
+        // storage action remains.
+        inspector.start_frame(&context, precompile);
         actions.record(StorageAction::Sstore(
             other,
             U256::ZERO,
             U256::ZERO,
             U256::ONE,
         ));
-        inspector.finish_frame(&context);
+        inspector.finish_frame(&context, true);
 
         let other_only = NativeStorageWrites {
             own: false,
@@ -1078,7 +1068,7 @@ mod tests {
             .with_tx(TempoTxEnv::default());
         let mut inspector = NativeStorageChangeInspector::new(actions.clone());
 
-        inspector.start_frame(&context, precompile, true);
+        inspector.start_frame(&context, precompile);
         actions.record(StorageAction::Sstore(
             precompile,
             U256::ZERO,
@@ -1087,19 +1077,22 @@ mod tests {
         ));
         // A failed precompile has already reverted its journal checkpoint before call_end.
         assert!(context.journaled_state.journal.is_empty());
-        inspector.finish_frame(&context);
+        inspector.finish_frame(&context, true);
 
         assert_eq!(inspector.into_changes(), vec![(precompile, OWN_WRITE)]);
     }
 
     #[test]
-    fn debank_inspector_marks_tip20_transfer_storage_change() {
+    fn debank_trace_marks_storage_writes_end_to_end() {
+        use alloy_primitives::{Bytes, bytes};
         use alloy_sol_types::SolCall;
         use reth_evm::EvmEnv;
         use revm::{
             DatabaseCommit,
+            bytecode::Bytecode,
             context::{CfgEnv, TxEnv},
             primitives::TxKind,
+            state::AccountInfo,
         };
         use tempo_chainspec::hardfork::TempoHardfork;
         use tempo_evm::evm::TempoEvm;
@@ -1127,53 +1120,68 @@ mod tests {
         .unwrap();
         let setup_state = evm.ctx_mut().journaled_state.finalize();
         evm.db_mut().commit(setup_state);
+        // PUSH1 1 PUSH1 0 SSTORE
+        let sstore_contract = Address::repeat_byte(0x03);
+        evm.db_mut().insert_account_info(
+            sstore_contract,
+            AccountInfo::from_bytecode(Bytecode::new_raw(bytes!("6001600055"))),
+        );
 
-        // Same wiring as trace_debankBlock: TIP-20 tokens are served through the precompile
-        // lookup, so they must be classified as precompiles by `Inspector::call`.
+        // Same wiring as trace_debankBlock. Each call runs against the same pre-state.
         let evm = evm.with_actions();
         let storage_actions = evm.storage_actions();
         let mut evm = evm.with_inspector(new_debank_inspector(storage_actions));
-        let result = evm
-            .transact(TempoTxEnv {
-                inner: TxEnv {
-                    caller: sender,
-                    gas_limit: 1_000_000,
-                    kind: TxKind::Call(PATH_USD_ADDRESS),
-                    data: ITIP20::transferCall {
-                        to: recipient,
-                        amount: U256::from(100),
-                    }
-                    .abi_encode()
-                    .into(),
+        let mut trace_call = |to: Address, data: Bytes| {
+            let result = evm
+                .transact(TempoTxEnv {
+                    inner: TxEnv {
+                        caller: sender,
+                        gas_limit: 1_000_000,
+                        kind: TxKind::Call(to),
+                        data,
+                        ..Default::default()
+                    },
+                    fee_token: Some(PATH_USD_ADDRESS),
                     ..Default::default()
-                },
-                fee_token: Some(PATH_USD_ADDRESS),
-                ..Default::default()
-            })
-            .unwrap();
-        assert!(result.result.is_success(), "{:?}", result.result);
+                })
+                .unwrap();
+            assert!(result.result.is_success(), "{:?}", result.result);
 
-        let (inspector, native) = mem::replace(
-            evm.components_mut().1,
-            new_debank_inspector(StorageActions::disabled()),
-        );
-        // The token writes its own balances.
-        let native_changes = native.into_changes();
-        assert_eq!(native_changes, vec![(PATH_USD_ADDRESS, OWN_WRITE)]);
+            let next_inspector = new_debank_inspector(evm.storage_actions());
+            let (inspector, native) = mem::replace(evm.components_mut().1, next_inspector);
+            let mut arena = inspector.into_traces();
+            let native_changes =
+                align_native_storage_changes(&mut arena, native.into_changes(), true).unwrap();
+            let (traces, error_traces, _, _) = build_debank_traces(
+                B256::ZERO,
+                arena,
+                &native_changes,
+                &std::cell::RefCell::new(0),
+            );
+            assert!(error_traces.is_empty());
+            assert_eq!(traces.len(), 1);
+            traces.into_iter().next().unwrap()
+        };
 
-        let mut arena = inspector.into_traces();
-        let native_changes =
-            align_native_storage_changes(&mut arena, native_changes, true).unwrap();
-        let (traces, error_traces, _, _) = build_debank_traces(
-            B256::ZERO,
-            arena,
-            &native_changes,
-            &std::cell::RefCell::new(0),
+        // A TIP-20 transfer writes the token's own balances natively, without an SSTORE. TIP-20
+        // tokens are served through the precompile lookup, so only the call outcome identifies
+        // them as precompiles.
+        let transfer = trace_call(
+            PATH_USD_ADDRESS,
+            ITIP20::transferCall {
+                to: recipient,
+                amount: U256::from(100),
+            }
+            .abi_encode()
+            .into(),
         );
-        assert!(error_traces.is_empty());
-        assert_eq!(traces.len(), 1);
-        assert!(traces[0].self_storage_change);
-        assert!(traces[0].storage_change);
+        assert!(transfer.self_storage_change);
+        assert!(transfer.storage_change);
+
+        // SSTORE flags of an EVM frame must survive merging its (empty) native writes.
+        let sstore = trace_call(sstore_contract, Bytes::new());
+        assert!(sstore.self_storage_change);
+        assert!(sstore.storage_change);
     }
 
     #[test]

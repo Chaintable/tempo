@@ -1339,62 +1339,105 @@ mod tests {
     fn native_precompile_storage_change_marks_frame_and_ancestors() {
         let root = Address::repeat_byte(0x44);
         let precompile = Address::repeat_byte(0x55);
-        for writes in [
-            NativeStorageWrites {
-                own: true,
-                any: true,
-            },
-            // A precompile that only writes other accounts, e.g. TIP20Factory initializing a
-            // new token: the call changed storage, but not its own.
-            NativeStorageWrites {
-                own: false,
-                any: true,
-            },
-        ] {
-            let mut arena = CallTraceArena::default();
-            arena.nodes_mut()[0] = CallTraceNode {
-                children: vec![1],
-                ordering: vec![TraceMemberOrder::Call(0)],
-                trace: CallTrace {
-                    success: true,
-                    address: root,
-                    kind: CallKind::Call,
-                    ..Default::default()
-                },
+        let mut arena = CallTraceArena::default();
+        arena.nodes_mut()[0] = CallTraceNode {
+            children: vec![1],
+            ordering: vec![TraceMemberOrder::Call(0)],
+            trace: CallTrace {
+                success: true,
+                address: root,
+                kind: CallKind::Call,
                 ..Default::default()
-            };
-            arena.nodes_mut().push(CallTraceNode {
-                parent: Some(0),
-                idx: 1,
-                trace: CallTrace {
-                    depth: 1,
-                    success: true,
-                    address: precompile,
-                    kind: CallKind::Call,
-                    maybe_precompile: Some(true),
-                    ..Default::default()
-                },
+            },
+            ..Default::default()
+        };
+        arena.nodes_mut().push(CallTraceNode {
+            parent: Some(0),
+            idx: 1,
+            trace: CallTrace {
+                depth: 1,
+                success: true,
+                address: precompile,
+                kind: CallKind::Call,
+                maybe_precompile: Some(true),
                 ..Default::default()
-            });
+            },
+            ..Default::default()
+        });
+        let other_account_arena = arena.clone();
+        let mut failed_child_arena = arena.clone();
+        failed_child_arena.nodes_mut()[1].trace.success = false;
+        let own_write = NativeStorageWrites {
+            own: true,
+            any: true,
+        };
 
-            let (traces, error_traces, _, _) = build_debank_traces(
-                H256::repeat_byte(0xaa),
-                arena,
-                &[(root, NativeStorageWrites::default()), (precompile, writes)],
-                &std::cell::RefCell::new(0),
-            );
+        let (traces, error_traces, _, _) = build_debank_traces(
+            H256::repeat_byte(0xaa),
+            arena,
+            &[
+                (root, NativeStorageWrites::default()),
+                (precompile, own_write),
+            ],
+            &std::cell::RefCell::new(0),
+        );
 
-            assert!(error_traces.is_empty());
-            let root_trace = traces.iter().find(|trace| trace.to_addr == root).unwrap();
-            assert!(!root_trace.self_storage_change);
-            assert!(root_trace.storage_change);
-            let precompile_trace = traces
-                .iter()
-                .find(|trace| trace.to_addr == precompile)
-                .unwrap();
-            assert_eq!(precompile_trace.self_storage_change, writes.own);
-            assert!(precompile_trace.storage_change);
-        }
+        assert!(error_traces.is_empty());
+        let root_trace = traces.iter().find(|trace| trace.to_addr == root).unwrap();
+        assert!(!root_trace.self_storage_change);
+        assert!(root_trace.storage_change);
+        let precompile_trace = traces
+            .iter()
+            .find(|trace| trace.to_addr == precompile)
+            .unwrap();
+        assert!(precompile_trace.self_storage_change);
+        assert!(precompile_trace.storage_change);
+
+        // A precompile that only writes other accounts, e.g. TIP20Factory initializing a new
+        // token: the call changed storage, but not its own.
+        let (traces, _, _, _) = build_debank_traces(
+            H256::repeat_byte(0xaa),
+            other_account_arena,
+            &[
+                (root, NativeStorageWrites::default()),
+                (
+                    precompile,
+                    NativeStorageWrites {
+                        own: false,
+                        any: true,
+                    },
+                ),
+            ],
+            &std::cell::RefCell::new(0),
+        );
+        let root_trace = traces.iter().find(|trace| trace.to_addr == root).unwrap();
+        assert!(root_trace.storage_change);
+        let precompile_trace = traces
+            .iter()
+            .find(|trace| trace.to_addr == precompile)
+            .unwrap();
+        assert!(!precompile_trace.self_storage_change);
+        assert!(precompile_trace.storage_change);
+
+        // A failed child keeps its own flags, but its writes were rolled back and do not
+        // propagate to the parent.
+        let (traces, error_traces, _, _) = build_debank_traces(
+            H256::repeat_byte(0xaa),
+            failed_child_arena,
+            &[
+                (root, NativeStorageWrites::default()),
+                (precompile, own_write),
+            ],
+            &std::cell::RefCell::new(0),
+        );
+        let root_trace = traces.iter().find(|trace| trace.to_addr == root).unwrap();
+        assert!(!root_trace.storage_change);
+        let precompile_trace = error_traces
+            .iter()
+            .find(|trace| trace.to_addr == precompile)
+            .unwrap();
+        assert!(precompile_trace.self_storage_change);
+        assert!(precompile_trace.storage_change);
     }
 
     #[test]
