@@ -99,7 +99,7 @@ Revert tx: `ExecutionResult::Revert` 没有 logs 字段。handler 的 fee log �
 | revert tx fee log | 无此问题 | 从 receipt serde 反序列化补回 |
 | trace 分类 | CallTraceArena success 标志 | receipt status 最终决定 |
 | AA tx | 无 | to_addr/input 来自解包后数据 |
-| exclude_precompile_calls | `false` | `true`（Tempo 自定义预编译不在 warm_addresses 中，不受影响） |
+| exclude_precompile_calls | `false` | `false`（标准预编译调用保留在 trace 中，与 native inspector 的逐调用记录一一对应） |
 | deposit_nonce | OP Stack 支持 | 不需要（非 OP Stack） |
 
 **与 pipeline Go 版的字段兼容性**:
@@ -150,15 +150,23 @@ Revert tx: `ExecutionResult::Revert` 没有 logs 字段。handler 的 fee log �
 
 ### exclude_precompile_calls 设置 (CTO CR #1 — 已撤回)
 
-`trace_block.rs` 设为 `true`，排除标准预编译 (0x01-0x09) 的 call trace。CTO 初始认为会丢失 Tempo 自定义预编译 trace，**经确认：Tempo 自定义预编译 (TIP-20, FeeManager 等) 通过 `set_precompile_lookup` 注册，其地址不在 `warm_addresses()` 中，不受 `exclude_precompile_calls` 影响**。无需修改。
+`trace_block.rs` 曾设为 `true`，排除标准预编译 (0x01-0x09) 的 call trace；a0407b3e68 引入 `NativeStorageChangeInspector` 时改回 `false`，标准预编译调用也保留在 trace 中，使 trace 节点与 native inspector 的逐调用记录一一对应。CTO 初始认为设为 `true` 会丢失 Tempo 自定义预编译 trace，**经确认：Tempo 自定义预编译 (TIP-20, FeeManager 等) 通过 `set_precompile_lookup` 注册，其地址不在 `warm_addresses()` 中，不受 `exclude_precompile_calls` 影响**。
 
-### per-trace storage_change 对预编译无效 (CTO CR #7)
+### per-trace storage_change 对预编译无效 (CTO CR #7, 已修复)
 
-`debank_trace.rs` 中 `self_storage_change` 通过检测 SSTORE opcode 设置。Tempo 自定义预编译（TIP-20、FeeManager 等）的 storage 修改直接在 Rust 代码中操作 state，不走 SSTORE opcode，因此调用预编译的 trace `storage_change=false`，即使预编译实际修改了 storage slot。
+字段语义按写入本身判定，不只看 opcode：
+- `self_storage_change`：本调用写了自己的 storage，即调用执行所在账户的 storage：CALL / STATICCALL 为 `to_addr`，DELEGATECALL / CALLCODE 为调用方 `from_addr`。
+- `storage_change`：本调用写了任何账户的 storage，或者有成功的子调用 `storage_change=true`；失败子调用的写入已回滚，不向上传播。
 
-block 级 `storage_contracts`（从 `diff.cache` 提取）不受影响，能正确反映所有 storage 变化的合约地址。仅 per-trace 级信号对预编译调用无效。
+EVM 合约代码只能用 SSTORE 写当前执行上下文的 storage，`debank_trace.rs` 按 SSTORE opcode 置位即符合上述语义，与 geth pipeline 实现一致。Tempo 自定义预编译（TIP-20、FeeManager 等）用 Rust 代码直接写 state，不执行 SSTORE，只看 opcode 时调用预编译的 trace 两个字段都是 false，并导致父调用的 `storage_change` 也为 false。
 
-**已知限制**，与 reth-x 行为一致（reth-x 标准预编译同样不走 SSTORE）。
+**修复**: `trace_block.rs` 的 `NativeStorageChangeInspector` 对预编译调用收集 journal 的 `StorageChanged` 与 storage action 中的写入地址；调用 revert 后 journal 条目会回滚，但 storage action 仍保留，与 revert 前执行过 SSTORE 的处理一致：
+- 写入地址等于调用地址时置 `self_storage_change`。Tempo 预编译只接受直接调用，调用地址就是它的 storage 所在账户。
+- 有任何写入时置 `storage_change`。预编译可以在 Rust 里直接写其他账户，例如 `TIP20Factory.createToken` 初始化新 token、FeeManager `distribute_fees` 修改 token 余额；这类写入只体现在 `storage_change`，所以不能用 `self_storage_change` + `to_addr` 推出完整的写入账户集合。
+
+是否为预编译调用以 revm 返回的 `CallOutcome::was_precompile_called` 为准，在 `call_end` 中读取：revm 在 precompile 实际处理调用时置位，包括通过 `set_precompile_lookup` 注册的 Tempo 预编译。journal 的 `precompile_addresses()` 只包含 `PrecompilesMap::warm_addresses()` 中静态注册的标准预编译（见上节 CR #1），不能用来识别 Tempo 预编译。
+
+block 级 `storage_contracts` 由 `get_storage_contracts_from_bundle` 从回放后的 bundle state 计算，不依赖这两个字段；它只包含已提交的 storage 变更，不包含只在失败调用中写过的账户。
 
 ### event idx 连续性保证 (CTO 新增关注, 已修复)
 
