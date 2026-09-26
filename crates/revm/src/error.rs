@@ -90,9 +90,9 @@ pub enum TempoInvalidTransaction {
     #[error("expiring nonce transaction must have nonce == 0")]
     ExpiringNonceNonceNotZero,
 
-    /// Subblock transaction must have zero fee.
-    #[error("subblock transaction must have zero fee")]
-    SubblockTransactionMustHaveZeroFee,
+    /// The nonce key uses the reserved subblock prefix after T4.
+    #[error("subblock transactions are not supported")]
+    SubblockTransactionsDisabled,
 
     /// Invalid fee token fallback.
     #[error("invalid fee token: {0}")]
@@ -310,7 +310,7 @@ impl TempoInvalidTransaction {
             | Self::ExpiringNonceMissingTxEnv
             | Self::ExpiringNonceMissingValidBefore
             | Self::ExpiringNonceNonceNotZero
-            | Self::SubblockTransactionMustHaveZeroFee
+            | Self::SubblockTransactionsDisabled
             | Self::KeychainOpInSubblockTransaction
             | Self::LegacyKeychainSignature
             | Self::CallsValidation(_) => true,

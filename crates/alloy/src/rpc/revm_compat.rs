@@ -89,12 +89,12 @@ impl TempoTransactionRequest {
                     .map(RecoveredTempoAuthorization::new)
                     .collect(),
                 nonce_key: nonce_key.unwrap_or_default(),
+                subblock_transaction: false,
                 key_authorization,
                 signature_hash: B256::ZERO,
                 tx_hash: B256::ZERO,
                 valid_before: valid_before.map(NonZeroU64::get),
                 valid_after: valid_after.map(NonZeroU64::get),
-                subblock_transaction: false,
                 override_key_id: key_id,
                 expiring_nonce_idx: None,
             }))
