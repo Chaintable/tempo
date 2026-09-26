@@ -94,7 +94,6 @@ pub enum TempoInvalidTransaction {
     #[error("subblock transactions are not supported")]
     SubblockTransactionsDisabled,
 
-
     /// Invalid fee token fallback.
     #[error("invalid fee token: {0}")]
     InvalidFeeToken(Address),

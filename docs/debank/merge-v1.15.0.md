@@ -88,4 +88,4 @@ networks:
 
 上游 [#7449](https://github.com/tempoxyz/tempo/pull/7449) 无条件拒绝 `nonceKey` 首字节为 `0x5b` 的交易，同时删除了旧的区块分段、手续费失败处理和元数据校验。此次补丁仅恢复区块执行所需的 T4 前路径；T4 起在区块执行器和 Revm 校验器继续拒绝此类交易。没有恢复共识层的实时 subblock 生产、P2P 转发或 payload 注入。
 
-本地补丁验证：`tempo-evm` 104 项、`tempo-revm` 198 项单测通过；`tempo-node --all-targets` 编译通过；nightly rustfmt 与 `git diff --check` 通过。新增 T3 接受、T4/T11 拒绝的校验测试，并保留 T4 gas 计算及模拟交易豁免测试。上文测试机镜像 `c67046ca` 构建于此补丁之前，尚未代表补丁的远端重放结果。两网历史索引未发现 T4 前 `0x5b` 交易；本次仍未从 genesis 全量重放两网，因此不能以本地单测宣称全历史状态根已经逐块核对。
+本地补丁验证：`tempo-evm` 104 项、`tempo-revm` 198 项单测通过；`tempo-node --all-targets` 编译通过；nightly rustfmt 与 `git diff --check` 通过。新增 T3 接受、T4/T11 拒绝的校验测试，并保留 T4 gas 计算及模拟交易豁免测试。交叉 review 后将 RPC 模拟中的 `subblock_transaction` 恢复为旧版的 `false`，避免把普通模拟请求误当作历史 subblock；`tempo-node`、`tempo-alloy` 全 targets 再次编译通过。旧版仅对未最终确认 payload 传入 validator set，新版上游已删除该字段，本补丁未恢复这条共识实时验证路径；已确认区块的历史重放原本也不传 validator set。上文测试机镜像 `c67046ca` 构建于此补丁之前，尚未代表补丁的远端重放结果。两网历史索引未发现 T4 前 `0x5b` 交易；本次仍未从 genesis 全量重放两网，因此不能以本地单测宣称全历史状态根已经逐块核对。
