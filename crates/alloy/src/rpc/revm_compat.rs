@@ -89,6 +89,9 @@ impl TempoTransactionRequest {
                     .map(RecoveredTempoAuthorization::new)
                     .collect(),
                 nonce_key: nonce_key.unwrap_or_default(),
+                subblock_transaction: nonce_key.is_some_and(|key| {
+                    tempo_primitives::subblock::has_sub_block_nonce_key_prefix(&key)
+                }),
                 key_authorization,
                 signature_hash: B256::ZERO,
                 tx_hash: B256::ZERO,

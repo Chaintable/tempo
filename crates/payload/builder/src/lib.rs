@@ -399,6 +399,7 @@ where
             shared_gas_limit: 0,
             timestamp_millis_part: attributes.timestamp_millis_part(),
             consensus_context: attributes.consensus_context(),
+            subblock_fee_recipients: Default::default(),
         };
         let evm_env = self
             .evm_config

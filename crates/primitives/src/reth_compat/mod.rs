@@ -30,4 +30,6 @@ mod ed25519;
 
 mod header;
 
+mod subblock;
+
 pub(crate) mod transaction;

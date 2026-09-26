@@ -373,7 +373,7 @@ mod tests {
         },
     };
 
-    use crate::{TempoBlockEnv, TempoEvm, TempoInvalidTransaction, TempoTxEnv};
+    use crate::{TempoBlockEnv, TempoEvm, TempoHaltReason, TempoInvalidTransaction, TempoTxEnv};
     use revm::context::result::InvalidTransaction;
 
     // ==================== Test Constants ====================
@@ -922,7 +922,7 @@ mod tests {
             assert!(matches!(
                 result,
                 ExecutionResult::Halt {
-                    reason: HaltReason::OpcodeNotFound,
+                    reason: TempoHaltReason::Ethereum(HaltReason::OpcodeNotFound),
                     ..
                 }
             ));
@@ -4630,7 +4630,7 @@ mod tests {
                     assert!(matches!(
                         result,
                         ExecutionResult::Halt {
-                            reason: HaltReason::OutOfGas(_),
+                            reason: TempoHaltReason::Ethereum(HaltReason::OutOfGas(_)),
                             ..
                         }
                     ));

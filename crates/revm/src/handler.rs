@@ -3,13 +3,13 @@
 use std::{cmp::Ordering, fmt::Debug, sync::Arc};
 
 use alloy_primitives::{Address, U256};
-use reth_evm::EvmInternals;
+use reth_evm::{EvmError, EvmInternals};
 use revm::{
     Database,
     context::{
-        Block, Cfg, ContextTr, JournalTr, Transaction, TransactionType,
+        Block, Cfg, ContextTr, JournalTr, LocalContextTr, Transaction, TransactionType,
         journaled_state::account::JournaledAccountTr,
-        result::{EVMError, ExecutionResult, HaltReason, InvalidTransaction, ResultGas},
+        result::{EVMError, ExecutionResult, InvalidTransaction, ResultGas},
         transaction::{AccessListItem, AccessListItemTr},
     },
     context_interface::{
@@ -57,7 +57,7 @@ use tempo_primitives::{
 
 use crate::{
     ProtocolFeeContext, TempoBatchCallEnv, TempoEvm, TempoInvalidTransaction,
-    error::FeePaymentError,
+    error::{FeePaymentError, TempoHaltReason},
     evm::TempoContext,
     gas_credits,
     signature_gas::{primitive_signature_verification_gas, tempo_signature_verification_gas},
@@ -799,7 +799,7 @@ where
 {
     type Evm = TempoEvm<DB, I>;
     type Error = EVMError<DB::Error, TempoInvalidTransaction>;
-    type HaltReason = HaltReason;
+    type HaltReason = TempoHaltReason;
 
     /// Overridden transaction-level gas builder that reproduces the pre-T0
     /// behavior when the initial gas spending exceeds the gas limit.
@@ -919,7 +919,9 @@ where
     ) -> Result<ExecutionResult<Self::HaltReason>, Self::Error> {
         evm.clear();
 
-        MainnetHandler::default().execution_result(evm, result, result_gas)
+        MainnetHandler::default()
+            .execution_result(evm, result, result_gas)
+            .map(|result| result.map_haltreason(Into::into))
     }
 
     /// Override apply_eip7702_auth_list to support AA transactions with authorization lists.
@@ -1001,9 +1003,9 @@ where
             return Err(TempoInvalidTransaction::FeeTokenNotTip20 { address: fee_token }.into());
         }
 
-        // Skip fee token validation when the transaction is free.
+        // Skip fee token validation when the transaction is free and not part of a subblock.
         // The TIP20 prefix is already validated above.
-        if !tx.max_balance_spending()?.is_zero() {
+        if !tx.max_balance_spending()?.is_zero() || tx.is_subblock_transaction() {
             fee_manager.validate_fee_token(journal, fee_token, cfg.spec, actions.clone())?;
         }
 
@@ -1783,7 +1785,9 @@ where
         let tx = &evm.inner.tx;
 
         if let Some(aa_env) = tx.tempo_tx_env.as_ref() {
-            if tempo_primitives::subblock::has_sub_block_nonce_key_prefix(&aa_env.nonce_key) {
+            if cfg.spec().is_t4()
+                && tempo_primitives::subblock::has_sub_block_nonce_key_prefix(&aa_env.nonce_key)
+            {
                 return Err(TempoInvalidTransaction::SubblockTransactionsDisabled.into());
             }
             // Validate AA transaction structure (calls list, CREATE rules)
@@ -1819,6 +1823,13 @@ where
                 auth.signature()
                     .validate_version(cfg.spec().is_t1c())
                     .map_err(TempoInvalidTransaction::from)?;
+            }
+
+            let has_keychain_fields =
+                aa_env.key_authorization.is_some() || aa_env.signature.is_keychain();
+
+            if aa_env.subblock_transaction && has_keychain_fields {
+                return Err(TempoInvalidTransaction::KeychainOpInSubblockTransaction.into());
             }
 
             if let Some(key_auth) = &aa_env.key_authorization {
@@ -2151,7 +2162,38 @@ where
         error: Self::Error,
     ) -> Result<ExecutionResult<Self::HaltReason>, Self::Error> {
         evm.clear();
-        MainnetHandler::default().catch_error(evm, error)
+
+        // For subblock transactions that failed `collectFeePreTx` call we catch error and treat such transactions as valid.
+        if evm.ctx.tx.is_subblock_transaction()
+            && let Some(
+                TempoInvalidTransaction::CollectFeePreTx(_)
+                | TempoInvalidTransaction::FeeTokenPaused { .. }
+                | TempoInvalidTransaction::EthInvalidTransaction(
+                    InvalidTransaction::LackOfFundForMaxFee { .. },
+                ),
+            ) = error.as_invalid_tx_err()
+        {
+            // Commit the transaction.
+            //
+            // `collectFeePreTx` call will happen after the nonce bump so this will only commit the nonce increment.
+            evm.ctx.journaled_state.commit_tx();
+
+            evm.ctx().local_mut().clear();
+            evm.frame_stack().clear();
+
+            // On fee payment failure, treat the transaction as a halt that consumed entire regular gas limit.
+            let total_spent = core::cmp::min(evm.ctx.tx.gas_limit, evm.ctx.cfg.tx_gas_limit_cap());
+
+            Ok(ExecutionResult::Halt {
+                reason: TempoHaltReason::SubblockTxFeePayment,
+                logs: Default::default(),
+                gas: ResultGas::new_with_state_gas(total_spent, 0, 0, 0),
+            })
+        } else {
+            MainnetHandler::default()
+                .catch_error(evm, error)
+                .map(|result| result.map_haltreason(Into::into))
+        }
     }
 }
 
@@ -2513,7 +2555,8 @@ pub fn validate_time_window(
         });
     }
 
-    // Validate validBefore constraint.
+    // Validate validBefore constraint
+    // IMPORTANT: must be aligned with `RecoveredSubBlock::has_expired_transactions`.
     if let Some(before) = valid_before
         && block_timestamp >= before
     {

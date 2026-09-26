@@ -12,10 +12,7 @@ use alloy_primitives::{
 use reth_evm::block::InternalBlockExecutionError;
 use reth_revm::{
     Database as _, Inspector, State,
-    context::{
-        Transaction as _,
-        result::{ExecutionResult, HaltReason},
-    },
+    context::{Transaction as _, result::ExecutionResult},
     state::{Account, EvmState, EvmStorageSlot, TransactionId},
 };
 use tempo_precompiles::{
@@ -24,7 +21,7 @@ use tempo_precompiles::{
     storage::StorageAction,
     tip_fee_manager::amm::{Pool, compute_amount_out},
 };
-use tempo_revm::evm::TempoContext;
+use tempo_revm::{TempoHaltReason, evm::TempoContext};
 
 impl<'a, DB, I> TempoBlockExecutor<'a, &'a mut State<DB>, I>
 where
@@ -323,7 +320,7 @@ pub struct StorageActionReplayOutcome {
 #[derive(Debug)]
 pub struct StorageActionReplay {
     /// Precomputed transaction execution result that can be reused if actions are applied without conflicts.
-    pub result: ExecutionResult<HaltReason>,
+    pub result: ExecutionResult<TempoHaltReason>,
     /// Actions to replay in order to get to the state after the transaction execution.
     pub actions: Vec<StorageAction>,
     /// Semantic replay data for expiring nonce transactions.

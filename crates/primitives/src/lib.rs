@@ -26,7 +26,9 @@ mod header;
 pub use header::{TempoConsensusContext, TempoHeader};
 
 pub mod subblock;
-pub use subblock::{SubBlockMetadata, SubBlockVersion};
+pub use subblock::{
+    RecoveredSubBlock, SignedSubBlock, SubBlock, SubBlockMetadata, SubBlockVersion,
+};
 
 extern crate alloc;
 

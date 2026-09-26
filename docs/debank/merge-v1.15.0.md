@@ -1,6 +1,6 @@
 # Tempo v1.15.0 upstream 合并验证
 
-日期：2026-09-25。合并分支 `merge-v1.15.0`，审阅入口 [PR #14](https://github.com/Chaintable/tempo/pull/14)。主网快照追块、区块哈希和三个自定义 RPC 对账通过，等待用户 review/merge；release 尚未创建。
+日期：2026-09-25，2026-09-26 更新。合并分支 `merge-v1.15.0`，审阅入口 [PR #14](https://github.com/Chaintable/tempo/pull/14)。主网快照追块、区块哈希和三个自定义 RPC 对账通过，等待用户 review/merge；release 尚未创建。
 
 ## 1. 升级内容与必要性
 
@@ -12,7 +12,7 @@
 
 从 Chaintable `main=c7230be79608d9d0965c85c18723f0a5f3b79481` 合入上游 `v1.15.0=464e51994b541b37cb875d47747e38bb67e3692a`。当前 main 已包含 [PR #10](https://github.com/Chaintable/tempo/pull/10)、[#12](https://github.com/Chaintable/tempo/pull/12)、[#13](https://github.com/Chaintable/tempo/pull/13) 的 writer/RPC 改动。冲突涉及 20 个 GitHub workflow、根 Cargo.toml 和 Cargo.lock；没有需要人工选择业务语义的冲突。
 
-保留的 fork patch 是 `debank-rpc` crate、node 注册和 EVM storage action 访问入口，供 `trace_debankBlock`、`eth_multiCall`、`pre_traceMany` 及 writer 下游消费；storage action 的写入检测用于完整捕获嵌套调用的状态变化。`handler.rs` 保留逐交易构造 T1+ key authorization gas 参数的修复，避免跨 fork 的进程级缓存影响历史执行。另保留 Rust 1.96 构建设置及 Chaintable 的公共 ECR 构建和发布 workflow。Cargo.lock 以上游 v1.15.0 为基底，仅补 `debank-rpc`、`md-5 0.10.6` 和 `tempo-node` 对前者的依赖。自动合并的 EVM、node、handler 路径已由编译、单测和主网 RPC 对账覆盖。
+保留的 fork patch 是 `debank-rpc` crate、node 注册和 EVM storage action 访问入口，供 `trace_debankBlock`、`eth_multiCall`、`pre_traceMany` 及 writer 下游消费。`handler.rs` 保留逐交易构造 T1+ key authorization gas 参数的修复，避免跨 fork 的进程级缓存影响历史执行。另保留 Rust 1.96 构建设置及 Chaintable 的公共 ECR 构建和发布 workflow。Cargo.lock 以上游 v1.15.0 为基底，补入 fork 和 2026-09-26 历史兼容修复所需依赖。自动合并的 EVM、node、handler 路径已由编译、单测和主网 RPC 对账覆盖。
 
 ## 3. 部署情况
 
@@ -83,3 +83,9 @@ networks:
 ## 5. 待跟进事项
 
 用户 review/merge [PR #14](https://github.com/Chaintable/tempo/pull/14) 后才进入 release 镜像及 metadata 台账步骤；生产切换由 SRE 执行。本轮测试卷和容器保留供审阅，清理另行确认。
+
+## 6. T4 前 subblock 历史重放兼容修复（2026-09-26）
+
+上游 [#7449](https://github.com/tempoxyz/tempo/pull/7449) 无条件拒绝 `nonceKey` 首字节为 `0x5b` 的交易，同时删除了旧的区块分段、手续费失败处理和元数据校验。此次补丁仅恢复区块执行所需的 T4 前路径；T4 起在区块执行器和 Revm 校验器继续拒绝此类交易。没有恢复共识层的实时 subblock 生产、P2P 转发或 payload 注入。
+
+本地补丁验证：`tempo-evm` 104 项、`tempo-revm` 198 项单测通过；`tempo-node --all-targets` 编译通过；nightly rustfmt 与 `git diff --check` 通过。新增 T3 接受、T4/T11 拒绝的校验测试，并保留 T4 gas 计算及模拟交易豁免测试。上文测试机镜像 `c67046ca` 构建于此补丁之前，尚未代表补丁的远端重放结果。两网历史索引未发现 T4 前 `0x5b` 交易；本次仍未从 genesis 全量重放两网，因此不能以本地单测宣称全历史状态根已经逐块核对。
