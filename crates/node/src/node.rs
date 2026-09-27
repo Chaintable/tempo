@@ -320,7 +320,7 @@ impl TempoNode {
         self
     }
 
-    /// Sets the validator key for filtering subblock transactions.
+    /// Sets the validator key returned by the admin RPC API.
     pub fn with_validator_key(mut self, validator_key: Option<B256>) -> Self {
         self.validator_key = validator_key;
         self
@@ -356,7 +356,7 @@ where
     pub fn new(validator_key: Option<B256>) -> Self {
         Self {
             inner: RpcAddOns::new(
-                TempoEthApiBuilder::new(validator_key),
+                TempoEthApiBuilder::default(),
                 TempoEngineValidatorBuilder,
                 NoopEngineApiBuilder::default(),
                 BasicEngineValidatorBuilder::default(),
@@ -523,7 +523,6 @@ impl PayloadAttributesBuilder<TempoPayloadAttributes, TempoHeader>
             timestamp_millis_part,
             Default::default(),
             None,
-            Vec::new,
         )
     }
 }

@@ -632,6 +632,7 @@ mod tests {
         let sealed_block = SealedBlock::seal_slow(block);
 
         let context = evm_config.context_for_block(&sealed_block).unwrap();
+        assert_eq!(context.general_gas_limit, 10_000_000);
         assert!(context.subblock_fee_recipients.is_empty());
     }
 
