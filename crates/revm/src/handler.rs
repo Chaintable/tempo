@@ -1082,8 +1082,10 @@ where
                 .as_ref()
                 .ok_or(TempoInvalidTransaction::ExpiringNonceMissingTxEnv)?;
 
-            // Expiring nonce txs must have nonce == 0
-            if tx.nonce() != 0 {
+            // Before TIP-1106 activates, expiring nonce txs must have nonce == 0.
+            // At T12+, the nonce is an opaque discriminator committed to by the
+            // signing and replay-protection hashes.
+            if !spec.is_t12() && tx.nonce() != 0 {
                 return Err(TempoInvalidTransaction::ExpiringNonceNonceNotZero.into());
             }
 
@@ -1776,9 +1778,31 @@ where
             return Err(TempoInvalidTransaction::ValueTransferNotAllowed.into());
         }
 
-        // First perform standard validation (header + transaction environment)
+        // First perform standard validation (header + transaction environment).
         // This validates: prevrandao, excess_blob_gas, chain_id, gas limits, tx type support, etc.
-        validation::validate_env::<_, Self::Error>(evm.ctx())?;
+        // REVM rejects u64::MAX because protocol nonces are incremented after execution. Expiring
+        // nonces are never incremented, so validate the rest of the environment with a temporary
+        // in-range value. Before T12, Tempo's fork-specific validation below still rejects the
+        // discriminator, but does so with a transient error instead of a permanent nonce-overflow
+        // error. At T12+, the discriminator is accepted.
+        // TODO: Remove this workaround when migrating to EVM2. Its per-transaction-type handlers
+        // let Tempo omit the nonce-overflow check for expiring nonce transactions.
+        let is_max_expiring_nonce = evm.ctx.cfg.spec.is_t1()
+            && evm.ctx.tx.nonce() == u64::MAX
+            && evm
+                .ctx
+                .tx
+                .tempo_tx_env
+                .as_ref()
+                .is_some_and(|aa| aa.nonce_key == TEMPO_EXPIRING_NONCE_KEY);
+        if is_max_expiring_nonce {
+            evm.ctx.tx.inner.nonce = 0;
+        }
+        let validation_result = validation::validate_env::<_, Self::Error>(evm.ctx());
+        if is_max_expiring_nonce {
+            evm.ctx.tx.inner.nonce = u64::MAX;
+        }
+        validation_result?;
 
         // AA-specific validations
         let cfg = &evm.inner.cfg;
