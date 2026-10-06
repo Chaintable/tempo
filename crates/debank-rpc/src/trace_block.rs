@@ -21,7 +21,7 @@ use reth_rpc_eth_api::{
     },
 };
 use reth_rpc_eth_types::EthApiError;
-use reth_storage_api::{ChangeSetReader, StorageChangeSetReader};
+use reth_storage_api::{ChangeSetReader, StateProvider, StorageChangeSetReader};
 use revm::{
     Database, Inspector, JournalEntry,
     bytecode::opcode::OpCode,
@@ -671,7 +671,9 @@ where
                     .state_at_block_id(BlockId::hash(block.hash()))
                     .await?;
                 let mut replay_state = State::builder()
-                    .with_database(StateProviderDatabase::new(parent_state))
+                    .with_database(StateProviderDatabase::new(
+                        parent_state.into_evm_state_provider(),
+                    ))
                     .with_bundle_update()
                     .build();
 
@@ -833,7 +835,7 @@ where
                     account_changesets,
                     storage_changesets,
                     &destroyed_addresses,
-                    StateProviderDatabase::new(post_state),
+                    StateProviderDatabase::new(post_state.into_evm_state_provider()),
                 )
                 .map_err(|err| {
                     Eth::Error::from_eth_err(BlockExecutionError::msg(format!(
