@@ -236,7 +236,9 @@ pub(crate) struct Actor<TContext, TExecutionLayer, TMarshal> {
     /// consensus round. Initialized from the local finalized state.
     delivered_finalized_tip: (Round, Height, Digest),
     /// The latest finalized tip announced by consensus, which may still
-    /// need to be delivered to the execution layer.
+    /// need to be delivered to the execution layer. Never below the finalized
+    /// blocks received from the marshal actor: each counts as a tip in the
+    /// round it was proposed in.
     network_finalized_tip: (Round, Height, Digest),
 
     /// The parent selected by the latest consensus context, independently of
@@ -257,15 +259,15 @@ pub(crate) struct Actor<TContext, TExecutionLayer, TMarshal> {
 #[derive(Clone)]
 struct Metrics {
     /// Number of finalized blocks whose proposer matches this node's public key.
-    finalized_blocks_proposed_by_self: commonware_runtime::telemetry::metrics::Registered<Counter>,
+    finalized_blocks_proposed_by_self: commonware_runtime::telemetry::metrics::Counter,
     /// Height distance from the locally canonicalized finalized tip up to
     /// the network's finalized tip: the undelivered finalized backlog.
-    finalization_lag: commonware_runtime::telemetry::metrics::Registered<Gauge>,
+    finalization_lag: commonware_runtime::telemetry::metrics::Gauge,
     /// Height distance from the execution layer's head to the pending head:
     /// the convergence backlog. Negative when consensus re-anchored below
     /// the head; holds its last value while the pending head's height is
     /// unknown (its body has not arrived yet).
-    convergence_depth: commonware_runtime::telemetry::metrics::Registered<Gauge>,
+    convergence_depth: commonware_runtime::telemetry::metrics::Gauge,
 }
 
 impl Metrics {
@@ -378,7 +380,7 @@ where
         };
         let finalized_round = if finalized.1 == finalized_tip.2 {
             finalized_tip.0
-        } else if finalized.0 == Height::zero() {
+        } else if finalized.0.is_zero() {
             Round::zero()
         } else {
             execution_node
@@ -720,7 +722,7 @@ where
         if !walk.awaits(digest) {
             return Ok(());
         }
-        if status == PayloadStatusEnum::Syncing && digest == self.pending_head.digest {
+        if status.is_syncing() && digest == self.pending_head.digest {
             self.pending_head.executed = None;
         }
         let (_, finalized_height, finalized_digest) = self.network_finalized_tip;
@@ -1107,7 +1109,12 @@ where
                 Height::new(height),
             )
             .await
-            .wrap_err_with(|| format!("failed backfilling block for height `{height}`"))?;
+            .wrap_err_with(|| {
+                format!(
+                    "failed backfilling block for height `{height}`: execution state is likely stale. \
+                     Run as a follower to sync to tip or restore a fresher snapshot"
+                )
+            })?;
 
             let (ack, _wait) = Exact::handle();
             let request = FinalizedBlockRequest {
@@ -1199,15 +1206,22 @@ where
             }
             Command::Finalize(finalized) => match *finalized {
                 Update::Tip(round, height, digest) => {
-                    self.record_convergence_target(round, (round.view(), digest));
-                    if round > self.network_finalized_tip.0 {
-                        if digest != self.network_finalized_tip.2 {
-                            self.pending_head.executed = None;
-                        }
-                        self.network_finalized_tip = (round, height, digest);
-                    }
+                    self.record_finalized_tip(round, height, digest);
                 }
                 Update::Block(block, acknowledgement) => {
+                    // Marshal reports a tip before the blocks up to it, except
+                    // after a crash: its block archive can keep a finalized
+                    // block whose finalization was lost, and marshal delivers
+                    // that block without a tip. The block proves its own
+                    // finality, so it is reported as a tip too, before its
+                    // delivery can move local finality past the tip. Blocks
+                    // at or below the tip were proposed no later than the
+                    // tip's round, so round order ignores them.
+                    self.record_finalized_tip(
+                        block.context().round,
+                        block.height(),
+                        block.digest(),
+                    );
                     self.pending_finalizations.push_back(FinalizedBlockRequest {
                         cause,
                         block,
@@ -1244,6 +1258,18 @@ where
             debug!(%round, "verification replaced a pending one for the same round");
         }
         self.queued_verifications.insert(round, verification);
+    }
+
+    /// Records a finalized tip, which also selects the finalized block as the
+    /// convergence target. Tips are ordered by round.
+    fn record_finalized_tip(&mut self, round: Round, height: Height, digest: Digest) {
+        self.record_convergence_target(round, (round.view(), digest));
+        if round > self.network_finalized_tip.0 {
+            if digest != self.network_finalized_tip.2 {
+                self.pending_head.executed = None;
+            }
+            self.network_finalized_tip = (round, height, digest);
+        }
     }
 
     /// Records the newest observed consensus round and its convergence target.
@@ -2360,7 +2386,7 @@ async fn execute_build(
         Ok(status) => status,
         Err(error) => return BuildOutcome::ParentDeliveryFailed(error),
     };
-    if status != PayloadStatusEnum::Valid {
+    if !status.is_valid() {
         warn!(%status, "build parent was not VALID");
         return BuildOutcome::Aborted {
             delivery_attempted: true,
@@ -2420,6 +2446,8 @@ async fn execute_build(
     fields(
         block.digest = %request.block.digest(),
         block.height = %request.block.height(),
+        proposal.epoch = request.block.context().round.epoch().get(),
+        proposal.view = request.block.context().round.view().get(),
     ),
 )]
 async fn execute_finalization(
@@ -2439,6 +2467,8 @@ async fn execute_finalization(
         block.digest = %block.digest(),
         block.height = %block.height(),
         block.parent_digest = %block.parent_digest(),
+        proposal.epoch = block.context().round.epoch().get(),
+        proposal.view = block.context().round.view().get(),
     ),
 )]
 async fn execute_delivery(
@@ -2465,12 +2495,9 @@ async fn deliver_block(
     execution_node: &impl ExecutionLayer,
     block: Arc<Block>,
 ) -> eyre::Result<PayloadStatusEnum> {
-    let (block, block_access_list) = Arc::unwrap_or_clone(block).into_parts();
+    let block = Arc::unwrap_or_clone(block).into_execution_block();
     let payload_status = execution_node
-        .new_payload(TempoExecutionData {
-            block,
-            block_access_list,
-        })
+        .new_payload(TempoExecutionData { block })
         .await
         .wrap_err("failed sending new-payload request to execution layer")?;
     if payload_status.is_valid() {
@@ -2579,11 +2606,9 @@ async fn run_payload_job(
             }
             // The application received the block and may propose it; hand
             // the body to the actor loop for a later build on this proposal.
-            let (execution_block, block_access_list, _) =
-                retained.into_consensus_execution_payload();
+            let (execution_block, _) = retained.into_consensus_execution_payload();
             Some(Arc::new(Block::from_execution_block_unchecked(
                 execution_block,
-                block_access_list,
             )))
         }
         Some(Err(error)) => {

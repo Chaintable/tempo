@@ -26,6 +26,8 @@ use rayon as _;
 mod error;
 pub use error::TempoEvmError;
 pub mod evm;
+#[cfg(feature = "genesis")]
+pub mod genesis;
 use core::num::NonZeroU64;
 use std::{borrow::Cow, sync::Arc};
 
@@ -55,8 +57,8 @@ use tempo_precompiles::{error::Result as TempoResult, storage::StorageActions};
 use tempo_revm::{TempoTxEnv, evm::TempoContext, gas_params::tempo_gas_params_with_amsterdam};
 
 pub use tempo_revm::{
-    FeeTokenResolver, ProtocolFeeContext, ProtocolFeeManager, TempoBlockEnv, TempoFeeManager,
-    TempoHaltReason, TempoInvalidTransaction, TempoStateAccess,
+    FeeTokenResolver, ProtocolFeeContext, ProtocolFeeManager, ResolvedFeeToken, TempoBlockEnv,
+    TempoFeeManager, TempoHaltReason, TempoInvalidTransaction, TempoStateAccess,
 };
 
 #[cfg(test)]
@@ -170,7 +172,7 @@ impl ConfigureEvm for TempoEvmConfig {
         let EvmEnv { cfg_env, block_env } = EvmEnv::for_eth_block(
             header,
             self.chain_spec(),
-            self.chain_spec().chain().id(),
+            self.chain_spec().chain_id(),
             self.chain_spec()
                 .blob_params_at_timestamp(header.timestamp()),
         );
@@ -206,6 +208,10 @@ impl ConfigureEvm for TempoEvmConfig {
                     .epoch_length()
                     .unwrap_or(NonZeroU64::MIN),
                 proposer_public_key: header.consensus_context.map(|ctx| ctx.proposer),
+                configurable_account_recovery_factory: self
+                    .chain_spec()
+                    .info
+                    .configurable_account_recovery_factory(),
             },
         })
     }
@@ -228,7 +234,7 @@ impl ConfigureEvm for TempoEvmConfig {
                 .next_block_base_fee(parent, attributes.timestamp)
                 .unwrap_or_default(),
             self.chain_spec(),
-            self.chain_spec().chain().id(),
+            self.chain_spec().chain_id(),
             self.chain_spec()
                 .blob_params_at_timestamp(attributes.timestamp),
         );
@@ -261,6 +267,10 @@ impl ConfigureEvm for TempoEvmConfig {
                     .epoch_length()
                     .unwrap_or(NonZeroU64::MIN),
                 proposer_public_key: attributes.consensus_context.map(|ctx| ctx.proposer),
+                configurable_account_recovery_factory: self
+                    .chain_spec()
+                    .info
+                    .configurable_account_recovery_factory(),
             },
         })
     }
@@ -549,7 +559,7 @@ mod tests {
 
         let system_tx = TempoTxEnvelope::Legacy(Signed::new_unhashed(
             TxLegacy {
-                chain_id: Some(reth_chainspec::EthChainSpec::chain(&*chainspec).id()),
+                chain_id: Some(chainspec.chain_id()),
                 nonce: 0,
                 gas_price: 0,
                 gas_limit: 0,
