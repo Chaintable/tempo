@@ -258,6 +258,7 @@ impl FollowerBuilder {
             // A follower is the only mode with a driver that can verify an
             // inbound certificate, so it is also the only one that ingests.
             gossip: with_gossip.then(|| crate::execution_runtime::gossip_config(true)),
+            estimator: None,
         };
 
         let (spawn_name, db, rocksdb) = if let Some(donor) = donor {
@@ -618,11 +619,12 @@ fn follower_bootstraps_from_follower() {
 
         // Height progress can precede ordered delivery into the secondary's
         // consensus feed, so wait for the state this test actually asserts.
-        follower_follower
-            .feed
-            .get_finalization(Query::Latest)
-            .await
-            .unwrap();
+        while !matches!(
+            follower_follower.feed.get_finalization(Query::Latest).await,
+            Response::Success(..)
+        ) {
+            context.sleep(Duration::from_millis(100)).await;
+        }
     });
 }
 

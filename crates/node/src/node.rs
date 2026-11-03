@@ -49,10 +49,8 @@ use reth_transaction_pool::{
 use std::sync::Arc;
 use tempo_chainspec::{TempoConsensusSpec, hardfork::TempoHardfork, spec::TempoChainSpec};
 use tempo_evm::{TempoEvmConfig, consensus::TempoConsensus};
-use tempo_payload_builder::{
-    DEFAULT_BUILD_TIME_MULTIPLIER, TempoPayloadBuilder, TempoPayloadBuilderConfig,
-};
-use tempo_payload_types::TempoPayloadAttributes;
+use tempo_payload_builder::{TempoPayloadBuilder, TempoPayloadBuilderConfig};
+use tempo_payload_types::{DEFAULT_BUILD_TIME_MULTIPLIER, Estimator, TempoPayloadAttributes};
 use tempo_primitives::{TempoHeader, TempoPrimitives, TempoTxEnvelope, TempoTxType};
 use tempo_transaction_pool::{
     AA2dPool, AA2dPoolConfig, AddressFilter, TempoTransactionPool,
@@ -120,7 +118,7 @@ pub struct TempoNodeArgs {
     /// Initial estimate of total replayable payload build work divided by work
     /// at transaction cutoff.
     ///
-    /// The builder updates this at runtime. Higher values stop pool transaction
+    /// The builder keeps learning the ratio at runtime. Higher values stop pool transaction
     /// execution earlier to leave more room for `builder_finish`.
     #[arg(
         long = "builder.build-time-multiplier",
@@ -179,6 +177,7 @@ impl TempoNodeArgs {
             enable_prewarming: !self.builder_disable_prewarming,
             enable_parallel: self.builder_parallel,
             build_time_multiplier: self.builder_build_time_multiplier,
+            estimator: None,
         }
     }
 }
@@ -310,7 +309,7 @@ impl TempoNode {
                     .with_pre_cache_state(false),
             )
             .network(network_builder)
-            .consensus(TempoConsensusBuilder::default())
+            .consensus(TempoConsensusBuilder)
     }
 
     pub fn provider_factory_builder() -> ProviderFactoryBuilder<Self> {
@@ -341,12 +340,28 @@ impl TempoNode {
         self
     }
 
+    /// Returns the payload builder settings, including any node overrides.
+    pub fn payload_builder_builder(&self) -> &TempoPayloadBuilderBuilder {
+        &self.payload_builder_builder
+    }
+
     /// Maps the payload builder builder.
     pub fn map_payload_builder_builder<F>(mut self, f: F) -> Self
     where
         F: FnOnce(TempoPayloadBuilderBuilder) -> TempoPayloadBuilderBuilder,
     {
         self.payload_builder_builder = f(self.payload_builder_builder);
+        self
+    }
+
+    /// Sets the proposal budget estimator the payload builder paces builds with.
+    ///
+    /// Clones share state, so passing a clone of the estimator the consensus
+    /// engine records validation feedback on lets the builder's stop decisions
+    /// account for it. Without one, the builder uses a private estimator seeded
+    /// from [`TempoPayloadBuilderBuilder::build_time_multiplier`].
+    pub fn with_estimator(mut self, estimator: Estimator) -> Self {
+        self.payload_builder_builder.estimator = Some(estimator);
         self
     }
 
@@ -499,7 +514,7 @@ where
     fn components_builder(&self) -> Self::ComponentsBuilder {
         Self::components(
             self.pool_builder.clone(),
-            self.payload_builder_builder,
+            self.payload_builder_builder.clone(),
             self.network_builder.clone(),
         )
     }
@@ -542,11 +557,12 @@ impl TempoPayloadAttributesBuilder {
 impl PayloadAttributesBuilder<TempoPayloadAttributes, TempoHeader>
     for TempoPayloadAttributesBuilder
 {
-    fn build(&self, _parent: &SealedHeader<TempoHeader>) -> TempoPayloadAttributes {
+    fn build(&self, parent: &SealedHeader<TempoHeader>) -> TempoPayloadAttributes {
         let millis = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
+        let millis = millis.max(parent.timestamp_millis() + 1);
 
         let (timestamp, timestamp_millis_part) = (millis / 1000, millis % 1000);
         TempoPayloadAttributes::new(
@@ -580,21 +596,9 @@ where
 }
 
 /// Builder for [`TempoConsensus`].
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy)]
 #[non_exhaustive]
-pub struct TempoConsensusBuilder {
-    /// Whether to allow BAL hashes before Amsterdam activation.
-    pub allow_bal_hashes: bool,
-}
-
-#[allow(clippy::derivable_impls)]
-impl Default for TempoConsensusBuilder {
-    fn default() -> Self {
-        Self {
-            allow_bal_hashes: cfg!(feature = "bal"),
-        }
-    }
-}
+pub struct TempoConsensusBuilder;
 
 impl<Node> ConsensusBuilder<Node> for TempoConsensusBuilder
 where
@@ -605,10 +609,7 @@ where
     type Consensus = TempoConsensus<<Node::Types as NodeTypes>::ChainSpec>;
 
     async fn build_consensus(self, ctx: &BuilderContext<Node>) -> eyre::Result<Self::Consensus> {
-        Ok(TempoConsensus::new_with_bal_hashes(
-            ctx.chain_spec(),
-            self.allow_bal_hashes,
-        ))
+        Ok(TempoConsensus::new(ctx.chain_spec()))
     }
 }
 
@@ -873,7 +874,7 @@ where
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct TempoPayloadBuilderBuilder {
     /// Enable state provider metrics for the payload builder.
@@ -884,7 +885,12 @@ pub struct TempoPayloadBuilderBuilder {
     pub enable_parallel: bool,
     /// Initial estimate of total replayable payload build work divided by work
     /// at transaction cutoff.
+    ///
+    /// Only used when no `estimator` is provided.
     pub build_time_multiplier: f64,
+    /// Proposal budget estimator the payload builder paces builds with, or
+    /// `None` for a private one seeded from `build_time_multiplier`.
+    pub estimator: Option<Estimator>,
 }
 
 impl Default for TempoPayloadBuilderBuilder {
@@ -894,6 +900,7 @@ impl Default for TempoPayloadBuilderBuilder {
             enable_prewarming: true,
             enable_parallel: false,
             build_time_multiplier: DEFAULT_BUILD_TIME_MULTIPLIER,
+            estimator: None,
         }
     }
 }
@@ -920,6 +927,9 @@ where
             _ => None,
         });
 
+        let estimator = self
+            .estimator
+            .unwrap_or_else(|| Estimator::new(self.build_time_multiplier));
         Ok(TempoPayloadBuilder::new(
             pool,
             ctx.provider().clone(),
@@ -932,8 +942,8 @@ where
                 enable_prewarming: self.enable_prewarming,
                 skip_state_root: ctx.config().tree_config().skip_state_root(),
                 enable_parallel: self.enable_parallel,
-                build_time_multiplier: self.build_time_multiplier,
             },
+            estimator,
         ))
     }
 }
@@ -958,14 +968,12 @@ fn parse_address_filter(value: &str) -> Result<AddressFilter, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        AddressFilter, TempoNode, TempoNodeArgs, TempoPayloadBuilderBuilder, TempoPoolBuilder,
-    };
+    use super::*;
     use alloy_primitives::Address;
+    use clap::Parser;
 
     #[test]
     fn lane_limit_cli_reaches_pool_builder() {
-        use clap::Parser;
         #[derive(Parser)]
         struct Args {
             #[command(flatten)]
@@ -1059,5 +1067,25 @@ mod tests {
         });
 
         assert!(node.payload_builder_builder.state_provider_metrics);
+    }
+
+    #[test_case::test_case(998; "same second")]
+    #[test_case::test_case(999; "next second")]
+    fn dev_payload_timestamp_advances_past_future_parent(timestamp_millis_part: u64) {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        let mut header = TempoHeader {
+            timestamp_millis_part,
+            ..Default::default()
+        };
+        header.inner.timestamp = timestamp;
+        let parent = SealedHeader::new_unhashed(header);
+
+        let attributes = TempoPayloadAttributesBuilder::new().build(&parent);
+
+        assert_eq!(attributes.timestamp_millis(), parent.timestamp_millis() + 1);
     }
 }
