@@ -41,6 +41,12 @@ use tempo_primitives::transaction::Call;
 
 use crate::{debank_trace::*, tracing::RpcTracingInspector};
 
+fn trace_execution_error<E: FromEthApiError>(error: BlockExecutionError) -> E {
+    // FromEthApiError erases block-execution details into InternalEthError.
+    tracing::error!(target: "debank_rpc", ?error, "block trace execution or validation failed");
+    E::from_eth_err(error)
+}
+
 #[derive(Debug)]
 struct NativeCallFrame {
     change_index: usize,
@@ -556,12 +562,14 @@ where
 
         let block_txs = BlockBody::transactions(block.body());
         if receipts.len() != block_txs.len() {
-            return Err(Eth::Error::from_eth_err(BlockExecutionError::msg(format!(
-                "trace_debankBlock receipt count mismatch for block {}: receipts {}, transactions {}",
-                block.number(),
-                receipts.len(),
-                block_txs.len(),
-            ))));
+            return Err(trace_execution_error::<Eth::Error>(
+                BlockExecutionError::msg(format!(
+                    "trace_debankBlock receipt count mismatch for block {}: receipts {}, transactions {}",
+                    block.number(),
+                    receipts.len(),
+                    block_txs.len(),
+                )),
+            ));
         }
         let mut debank_txs: Vec<DebankTransaction> = Vec::with_capacity(block_txs.len());
 
@@ -707,7 +715,7 @@ where
                 let mut executor = eth_api.evm_config().create_executor(evm, execution_ctx);
                 executor
                     .apply_pre_execution_changes()
-                    .map_err(Eth::Error::from_eth_err)?;
+                    .map_err(trace_execution_error::<Eth::Error>)?;
 
                 // Pre-execution system calls are block-level state changes, not transaction
                 // traces. Discard anything recorded while applying them and start each
@@ -731,7 +739,7 @@ where
                     inspector_state.borrow_mut().trace.set_aa(tx.ty() == 0x76);
                     let output = executor
                         .execute_transaction_without_commit(tx)
-                        .map_err(Eth::Error::from_eth_err)?;
+                        .map_err(trace_execution_error::<Eth::Error>)?;
 
                     let DebankInspectorState { trace: mut inspector, native: native_storage_inspector } =
                         inspector_state.replace(new_debank_inspector(storage_actions.clone()));
@@ -747,7 +755,7 @@ where
                         raw_native_storage_changes,
                         replay_tx_statuses[idx],
                     ) else {
-                        return Err(Eth::Error::from_eth_err(BlockExecutionError::msg(format!(
+                        return Err(trace_execution_error::<Eth::Error>(BlockExecutionError::msg(format!(
                             "trace_debankBlock native inspector mismatch for transaction {tx_hash}: trace nodes {trace_node_count}, native frames {native_frame_count}",
                         ))));
                     };
@@ -760,13 +768,13 @@ where
                             &inspector_log_index,
                         );
 
-                    executor.commit_transaction(output).map_err(Eth::Error::from_eth_err)?;
+                    executor.commit_transaction(output).map_err(trace_execution_error::<Eth::Error>)?;
                     storage_actions.clear();
                     let persisted_events = executor
                         .receipts()
                         .get(idx)
                         .ok_or_else(|| {
-                            Eth::Error::from_eth_err(BlockExecutionError::msg(format!(
+                            trace_execution_error::<Eth::Error>(BlockExecutionError::msg(format!(
                                 "trace_debankBlock missing replayed receipt for transaction {tx_hash}"
                             )))
                         })?
@@ -794,10 +802,10 @@ where
 
                 let execution_result = executor
                     .finish()
-                    .map_err(Eth::Error::from_eth_err)?;
+                    .map_err(trace_execution_error::<Eth::Error>)?;
 
                 if execution_result.gas_used != block.gas_used() {
-                    return Err(Eth::Error::from_eth_err(BlockExecutionError::msg(format!(
+                    return Err(trace_execution_error::<Eth::Error>(BlockExecutionError::msg(format!(
                         "trace_debankBlock gas mismatch for block {}: replayed {}, header {}",
                         block.number(),
                         execution_result.gas_used,
@@ -813,7 +821,7 @@ where
                 let replayed_receipts_root =
                     alloy_consensus::proofs::calculate_receipt_root(&receipts_with_bloom);
                 if replayed_receipts_root != block.receipts_root() {
-                    return Err(Eth::Error::from_eth_err(BlockExecutionError::msg(format!(
+                    return Err(trace_execution_error::<Eth::Error>(BlockExecutionError::msg(format!(
                         "trace_debankBlock receipts root mismatch for block {}: replayed {}, header {}",
                         block.number(),
                         replayed_receipts_root,
@@ -849,7 +857,7 @@ where
                     StateProviderDatabase::new(post_state.into_evm_state_provider()),
                 )
                 .map_err(|err| {
-                    Eth::Error::from_eth_err(BlockExecutionError::msg(format!(
+                    trace_execution_error::<Eth::Error>(BlockExecutionError::msg(format!(
                         "trace_debankBlock failed to build canonical state diff for block {}: {err}",
                         block.number(),
                     )))
@@ -858,7 +866,7 @@ where
                 if replayed_state_diff != canonical_state_diff {
                     let replayed_hash = keccak256(alloy_rlp::encode(&replayed_state_diff));
                     let canonical_hash = keccak256(alloy_rlp::encode(&canonical_state_diff));
-                    return Err(Eth::Error::from_eth_err(BlockExecutionError::msg(format!(
+                    return Err(trace_execution_error::<Eth::Error>(BlockExecutionError::msg(format!(
                         "trace_debankBlock state diff mismatch for block {}: replayed {} (accounts {}, deleted {}, storage {}, codes {}), canonical {} (accounts {}, deleted {}, storage {}, codes {})",
                         block.number(),
                         replayed_hash,
@@ -1180,6 +1188,13 @@ mod tests {
             };
             let tx_env: TempoTxEnv = Recovered::new_unchecked(envelope, sender).into();
             inspector_state.borrow_mut().trace.set_aa(aa);
+            // Exercise pre_traceMany's parity filtering as well as DeBank's tree.
+            inspector_state
+                .borrow_mut()
+                .trace
+                .inner
+                .config_mut()
+                .exclude_precompile_calls = aa;
             let result = evm
                 .transact(&Recovered::new_unchecked(tx_env, sender))
                 .unwrap()
@@ -1190,6 +1205,16 @@ mod tests {
                 native,
             } = inspector_state.replace(new_debank_inspector(storage_actions.clone()));
             storage_actions.clear();
+            if aa {
+                let parity = inspector
+                    .inner
+                    .clone()
+                    .into_parity_builder()
+                    .into_localized_transaction_traces(Default::default());
+                assert_eq!(parity.len(), 3);
+                assert_eq!(parity[1].trace.trace_address, vec![0]);
+                assert_eq!(parity[2].trace.trace_address, vec![1]);
+            }
             let mut arena = inspector.inner.into_traces();
             let raw_changes = native.into_changes();
             let native_changes =

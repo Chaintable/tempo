@@ -12,6 +12,7 @@ pub(crate) struct RpcTracingInspector {
     pub(crate) inner: TracingInspector,
     entered: bool,
     aa: bool,
+    static_precompiles: Vec<Address>,
 }
 
 impl RpcTracingInspector {
@@ -20,6 +21,7 @@ impl RpcTracingInspector {
             inner: TracingInspector::new(config),
             entered: false,
             aa,
+            static_precompiles: Vec::new(),
         }
     }
 
@@ -33,6 +35,11 @@ impl RpcTracingInspector {
             return;
         }
         self.entered = true;
+        if self.inner.config().exclude_precompile_calls {
+            // The previous inspector excluded the journal's warm address set,
+            // which contained Ethereum precompiles, not Tempo's dynamic lookup.
+            self.static_precompiles = interp.host().precompiles().addresses();
+        }
         if self.aa {
             // EVM2 replaces an unattached root on every top-level call. Keep a
             // trace-only transaction parent open across all AA calls, as in the
@@ -66,13 +73,19 @@ impl<T: EvmTypes> Inspector<T> for RpcTracingInspector {
         message: &mut Message<T>,
     ) -> Option<MessageResult<T>> {
         self.enter(interp);
-        if self.aa {
+        let exclude_precompiles = self.inner.config().exclude_precompile_calls;
+        self.inner.config_mut().exclude_precompile_calls = exclude_precompiles
+            && !(self.aa && message.depth == 0)
+            && self.static_precompiles.contains(&message.call_target);
+        let result = if self.aa {
             let mut trace_message = message.clone();
             trace_message.depth += 1;
             self.inner.call(interp, &mut trace_message)
         } else {
             self.inner.call(interp, message)
-        }
+        };
+        self.inner.config_mut().exclude_precompile_calls = exclude_precompiles;
+        result
     }
 
     fn call_end(
