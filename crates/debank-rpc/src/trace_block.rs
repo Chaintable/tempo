@@ -1108,6 +1108,7 @@ mod tests {
             &sstore_contract,
             AccountInfo::default().with_code(Bytecode::new_raw(bytes!("6001600055"))),
         );
+        let mut parent_db = db.clone();
         let config = TempoEvmConfig::moderato();
         let mut version = tempo_chainspec::gas_params::version(evm2::SpecId::OSAKA, spec, false);
         version.chain_id = 1;
@@ -1131,6 +1132,8 @@ mod tests {
             storage_actions.clone(),
             non_creditable_slots,
         ));
+        let inspector_state = Rc::new(RefCell::new(new_debank_inspector(storage_actions.clone())));
+        evm.set_inspector(DebankInspector(inspector_state.clone()));
         StorageCtx::enter_evm_without_tip1060_accounting(&mut evm, || {
             TIP20Setup::path_usd(sender)
                 .with_issuer(sender)
@@ -1138,10 +1141,18 @@ mod tests {
                 .apply()
         })
         .unwrap();
+        // Native protocol logs can arrive with no call/create hook. They must
+        // remain in receipt storage without panicking in the call-tree tracer.
+        assert!(!evm.state().logs().is_empty());
+        assert!(
+            inspector_state.borrow().trace.inner.traces().nodes()[0]
+                .logs
+                .is_empty()
+        );
+        evm.state_mut().logs_mut().clear();
         evm.state_mut().commit_transaction();
         storage_actions.clear();
-        let inspector_state = Rc::new(RefCell::new(new_debank_inspector(storage_actions.clone())));
-        evm.set_inspector(DebankInspector(inspector_state.clone()));
+        inspector_state.replace(new_debank_inspector(storage_actions.clone()));
         let mut trace_call = |to: Address, data: Bytes, aa: bool| {
             let tx = Signed::new_unchecked(
                 TxLegacy {
@@ -1200,6 +1211,26 @@ mod tests {
                 .unwrap()
                 .detach();
             assert!(result.result.is_success(), "{:?}", result.result);
+            use evm2::evm::StateChangeSource;
+            let mut changes = reth_execution_types::TransactionChanges::default();
+            let Ok(()) = result.pending_state.visit(&mut changes);
+            let mut block_state = reth_execution_types::BlockState::new();
+            block_state.commit(&changes);
+            let diff = get_storage_diffs_from_bundle(block_state.into_bundle(), &mut parent_db);
+            assert!(
+                diff.new_codes.is_empty(),
+                "unchanged code must not be emitted"
+            );
+            if aa || to == sstore_contract {
+                let storage = diff
+                    .storage_diffs
+                    .iter()
+                    .find(|entry| entry.address == keccak256(sstore_contract))
+                    .expect("real EVM SSTORE must reach the state diff");
+                assert!(storage.diffs.iter().any(|entry| {
+                    entry.index == keccak256([0u8; 32]) && entry.value == U256::ONE
+                }));
+            }
             let DebankInspectorState {
                 trace: inspector,
                 native,

@@ -13,6 +13,7 @@ pub(crate) struct RpcTracingInspector {
     entered: bool,
     aa: bool,
     static_precompiles: Vec<Address>,
+    active_frames: usize,
 }
 
 impl RpcTracingInspector {
@@ -22,6 +23,7 @@ impl RpcTracingInspector {
             entered: false,
             aa,
             static_precompiles: Vec::new(),
+            active_frames: 0,
         }
     }
 
@@ -64,7 +66,12 @@ impl<T: EvmTypes> Inspector<T> for RpcTracingInspector {
     }
 
     fn log(&mut self, log: &Log, host: &mut Evm<'_, T>) {
-        <TracingInspector as Inspector<T>>::log(&mut self.inner, log, host);
+        // Protocol hooks can emit logs outside any EVM message. Such logs have
+        // no call-tree parent; the unchanged receipt path retains them and the
+        // block RPC reconciles them with its event output after execution.
+        if self.active_frames != 0 {
+            <TracingInspector as Inspector<T>>::log(&mut self.inner, log, host);
+        }
     }
 
     fn call(
@@ -73,6 +80,7 @@ impl<T: EvmTypes> Inspector<T> for RpcTracingInspector {
         message: &mut Message<T>,
     ) -> Option<MessageResult<T>> {
         self.enter(interp);
+        self.active_frames += 1;
         let exclude_precompiles = self.inner.config().exclude_precompile_calls;
         self.inner.config_mut().exclude_precompile_calls = exclude_precompiles
             && !(self.aa && message.depth == 0)
@@ -95,6 +103,7 @@ impl<T: EvmTypes> Inspector<T> for RpcTracingInspector {
         result: &mut MessageResult<T>,
     ) {
         self.inner.call_end(interp, message, result);
+        self.active_frames -= 1;
     }
 
     fn create(
@@ -103,6 +112,7 @@ impl<T: EvmTypes> Inspector<T> for RpcTracingInspector {
         message: &mut Message<T>,
     ) -> Option<MessageResult<T>> {
         self.enter(interp);
+        self.active_frames += 1;
         if self.aa {
             let mut trace_message = message.clone();
             trace_message.depth += 1;
@@ -119,6 +129,7 @@ impl<T: EvmTypes> Inspector<T> for RpcTracingInspector {
         result: &mut MessageResult<T>,
     ) {
         self.inner.create_end(interp, message, result);
+        self.active_frames -= 1;
     }
 
     fn selfdestruct(
