@@ -5,7 +5,6 @@ use jsonrpsee::core::RpcResult;
 use reth_rpc_convert::RpcTxReq;
 use reth_rpc_eth_api::{EthApiTypes, helpers::EthCall};
 use reth_rpc_eth_types::EthApiError;
-use revm::context::result::ExecutionResult;
 
 use crate::{
     erc20_handle::{NATIVE_TOKEN_ADDRESS, eth_erc20_handle},
@@ -87,7 +86,7 @@ where
                     let to_addr = request.as_ref().to.as_ref().and_then(|kind| kind.to());
                     if to_addr == Some(&NATIVE_TOKEN_ADDRESS) {
                         let input = request.as_ref().input.input();
-                        let mut res = eth_erc20_handle(&db, input.map(|b| b.as_ref()));
+                        let mut res = eth_erc20_handle(&mut db, input.map(|b| b.as_ref()));
                         if res.code != MultiCallErrorCode::Success as i32 {
                             multi_call_stats.success = false;
                         }
@@ -104,32 +103,30 @@ where
 
                     let execute_result = eth_api.transact(&mut db, current_evm_env, prepared_tx)?;
 
-                    let mut res = match execute_result.result {
-                        ExecutionResult::Success { output, gas, .. } => SingleCallResult {
+                    let result = execute_result.result;
+                    let gas_used = result.tx_gas_used() as i64;
+                    let mut res = if result.is_success() {
+                        SingleCallResult {
                             code: MultiCallErrorCode::Success as i32,
-                            err: String::new(),
-                            from_cache: false,
-                            result: output.into_data(),
-                            gas_used: gas.tx_gas_used() as i64,
-                            time_cost: 0.0,
-                        },
-                        ExecutionResult::Revert { output, gas, .. } => SingleCallResult {
+                            result: result.output,
+                            gas_used,
+                            ..Default::default()
+                        }
+                    } else if result.is_revert() {
+                        SingleCallResult {
                             code: MultiCallErrorCode::EVMReverted as i32,
-                            err: alloy_sol_types::decode_revert_reason(&output)
+                            err: alloy_sol_types::decode_revert_reason(&result.output)
                                 .unwrap_or_else(|| "Reason Unknown".to_string()),
-                            from_cache: false,
-                            result: alloy_primitives::Bytes::default(),
-                            gas_used: gas.tx_gas_used() as i64,
-                            time_cost: 0.0,
-                        },
-                        ExecutionResult::Halt { reason, gas, .. } => SingleCallResult {
+                            gas_used,
+                            ..Default::default()
+                        }
+                    } else {
+                        SingleCallResult {
                             code: MultiCallErrorCode::EVMCancelled as i32,
-                            err: format!("Halted: {reason:?}"),
-                            from_cache: false,
-                            result: alloy_primitives::Bytes::default(),
-                            gas_used: gas.tx_gas_used() as i64,
-                            time_cost: 0.0,
-                        },
+                            err: format!("Halted: {:?}", result.stop),
+                            gas_used,
+                            ..Default::default()
+                        }
                     };
 
                     res.time_cost = start.elapsed().as_secs_f64();

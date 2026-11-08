@@ -8,14 +8,14 @@ use alloy_primitives::{
 };
 use alloy_rlp::{RlpDecodable, RlpEncodable};
 use alloy_rpc_types_eth::Header;
-use reth_db_api::models::{AccountBeforeTx, BlockNumberAddress};
-use reth_primitives_traits::StorageEntry;
-use reth_revm::db::BundleState;
-use revm::DatabaseRef;
-use revm_inspectors::tracing::{
+use evm2::evm::Database;
+use evm2_inspectors::tracing::{
     CallTraceArena,
     types::{CallKind, CallLog, CallTraceNode, TraceMemberOrder},
 };
+use reth_db_api::models::{AccountBeforeTx, BlockNumberAddress};
+use reth_evm::BundleState;
+use reth_primitives_traits::StorageEntry;
 use serde::{Deserialize, Serialize};
 use sha1::{Digest as Sha1Digest, Sha1};
 use std::{
@@ -300,9 +300,9 @@ pub fn calc_validation_hash(ids: &[String]) -> i64 {
 // Error message formatting
 // ---------------------------------------------------------------------------
 
-pub(crate) fn fmt_error_msg(res: revm::interpreter::InstructionResult) -> Option<String> {
-    use revm::interpreter::InstructionResult;
-    if res.is_ok() {
+pub(crate) fn fmt_error_msg(res: evm2::interpreter::InstrStop) -> Option<String> {
+    use evm2::interpreter::InstrStop as InstructionResult;
+    if res.is_success() {
         return None;
     }
     let msg = match res {
@@ -349,7 +349,7 @@ impl From<&CallTraceNode> for DebankTrace {
             ..Default::default()
         };
         for op in &trace.steps {
-            if op.op == revm::bytecode::opcode::OpCode::SSTORE {
+            if op.op == evm2::interpreter::opcode::OpCode::SSTORE {
                 debank_trace.self_storage_change = true;
                 debank_trace.storage_change = true;
                 break;
@@ -598,7 +598,7 @@ fn finish_build_traces(
     }
 }
 
-/// Build DeBank traces and events from a revm `CallTraceArena`.
+/// Build DeBank traces and events from an EVM2 `CallTraceArena`.
 ///
 /// Returns `(traces, error_traces, events, error_events)`.
 pub fn build_debank_traces(
@@ -675,9 +675,9 @@ fn sort_block_storage_diff(diff: &mut BlockStorageDiff) {
     diff.new_codes.sort_unstable_by_key(|code| code.code_hash);
 }
 
-pub fn get_storage_diffs_from_bundle<DB: DatabaseRef>(
+pub fn get_storage_diffs_from_bundle<DB: Database>(
     bundle: BundleState,
-    pre_db: &DB,
+    pre_db: &mut DB,
 ) -> BlockStorageDiff {
     let mut new_accounts = Vec::new();
     let mut deleted_accounts = Vec::new();
@@ -708,14 +708,14 @@ pub fn get_storage_diffs_from_bundle<DB: DatabaseRef>(
             .into_iter()
             .filter(|(_, slot)| {
                 if storage_was_wiped {
-                    !slot.present_value.is_zero()
+                    !slot.present_value().is_zero()
                 } else {
-                    slot.present_value != slot.previous_or_original_value
+                    slot.present_value() != slot.original_value()
                 }
             })
             .map(|(key, slot)| IndexValuePair {
                 index: keccak256::<[u8; 32]>(key.to_be_bytes()),
-                value: slot.present_value,
+                value: slot.present_value(),
             })
             .collect::<Vec<_>>();
         let has_storage_changes = !diffs.is_empty();
@@ -740,12 +740,16 @@ pub fn get_storage_diffs_from_bundle<DB: DatabaseRef>(
             });
         }
 
-        if let Some(code) = info.code.as_ref() {
+        if let Some(code) = info
+            .code
+            .as_ref()
+            .or_else(|| bundle.contracts.get(&info.code_hash))
+        {
             let code_hash = info.code_hash;
             if code_hash == KECCAK_EMPTY {
                 continue;
             }
-            if let Ok(Some(account)) = pre_db.basic_ref(address)
+            if let Ok(Some(account)) = pre_db.get_account(&address)
                 && account.code_hash == code_hash
             {
                 continue;
@@ -772,11 +776,11 @@ pub fn get_storage_diffs_from_bundle<DB: DatabaseRef>(
     diff
 }
 
-pub fn get_storage_diffs_from_changesets<DB: DatabaseRef>(
+pub fn get_storage_diffs_from_changesets<DB: Database>(
     account_changesets: Vec<AccountBeforeTx>,
     storage_changesets: Vec<(BlockNumberAddress, StorageEntry)>,
     destroyed_addresses: &HashSet<Address>,
-    post_db: DB,
+    mut post_db: DB,
 ) -> Result<BlockStorageDiff, DB::Error> {
     let mut new_accounts = Vec::new();
     let mut deleted_accounts = BTreeSet::new();
@@ -794,7 +798,7 @@ pub fn get_storage_diffs_from_changesets<DB: DatabaseRef>(
     let mut storage_by_address: BTreeMap<Address, Vec<IndexValuePair>> = BTreeMap::new();
     for (block_address, entry) in storage_changesets {
         let address = block_address.address();
-        let final_value = post_db.storage_ref(address, U256::from_be_bytes(entry.key.0))?;
+        let final_value = post_db.get_storage(&address, &U256::from_be_bytes(entry.key.0))?;
         let storage_was_wiped = destroyed_addresses.contains(&address);
         if (storage_was_wiped && !final_value.is_zero())
             || (!storage_was_wiped && final_value != entry.value)
@@ -812,7 +816,7 @@ pub fn get_storage_diffs_from_changesets<DB: DatabaseRef>(
 
     changed_addresses.extend(destroyed_addresses);
     for address in changed_addresses {
-        let post_account = post_db.basic_ref(address)?;
+        let post_account = post_db.get_account(&address)?;
         let pre_account = account_pre_state
             .get(&address)
             .cloned()
@@ -858,7 +862,7 @@ pub fn get_storage_diffs_from_changesets<DB: DatabaseRef>(
 
     for code_hash in changed_code_hashes {
         if code_hash != KECCAK_EMPTY {
-            let code = post_db.code_by_hash_ref(code_hash)?;
+            let code = post_db.get_code_by_hash(&code_hash)?;
             new_codes.push(NewCode {
                 code_hash,
                 code: code.original_bytes(),
@@ -1056,12 +1060,13 @@ pub fn build_genesis_txs_and_traces(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reth_revm::db::{AccountStatus, EmptyDB, InMemoryDB};
-    use revm::{
-        interpreter::InstructionResult,
-        state::{AccountInfo, Bytecode},
+    use evm2::{
+        bytecode::Bytecode,
+        evm::{AccountInfo, EmptyDB, InMemoryDB},
+        interpreter::InstrStop as InstructionResult,
     };
-    use revm_inspectors::tracing::types::{CallTrace, CallTraceNode, TraceMemberOrder};
+    use evm2_inspectors::tracing::types::{CallTrace, CallTraceNode, TraceMemberOrder};
+    use reth_trie_common::bundle_state::AccountStatus;
 
     #[test]
     fn create_and_create2_use_the_protocol_create_type() {
@@ -1241,17 +1246,11 @@ mod tests {
 
         let mut post_db = InMemoryDB::new(EmptyDB::default());
         for address in [changed, clone, recreated] {
-            post_db.insert_account_info(address, bundle.state[&address].info.clone().unwrap());
+            post_db.insert_account_info(&address, bundle.state[&address].info.clone().unwrap());
         }
-        post_db
-            .insert_account_storage(changed, changed_slot, U256::from(4))
-            .unwrap();
-        post_db
-            .insert_account_storage(changed, restored_slot, U256::from(5))
-            .unwrap();
-        post_db
-            .insert_account_storage(recreated, recreated_slot, U256::from(7))
-            .unwrap();
+        post_db.insert_account_storage(&changed, &changed_slot, &U256::from(4));
+        post_db.insert_account_storage(&changed, &restored_slot, &U256::from(5));
+        post_db.insert_account_storage(&recreated, &recreated_slot, &U256::from(7));
         let account_changesets = [changed, clone, recreated, deleted]
             .into_iter()
             .map(|address| AccountBeforeTx {
@@ -1293,7 +1292,7 @@ mod tests {
             post_db,
         )
         .unwrap();
-        let diff = get_storage_diffs_from_bundle(bundle, &InMemoryDB::new(EmptyDB::default()));
+        let diff = get_storage_diffs_from_bundle(bundle, &mut InMemoryDB::new(EmptyDB::default()));
         assert_eq!(diff, canonical_diff);
         assert_eq!(diff.new_accounts.len(), 3);
         assert!(

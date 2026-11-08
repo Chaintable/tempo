@@ -1,6 +1,6 @@
 use alloy_primitives::{Address, Bytes, U256};
 use alloy_sol_types::{SolType, sol_data};
-use revm::DatabaseRef;
+use evm2::evm::Database;
 
 use crate::types::{MultiCallErrorCode, SingleCallResult};
 
@@ -14,7 +14,7 @@ pub const NATIVE_TOKEN_ADDRESS: Address = Address::new([0xee; 20]);
 ///
 /// Simulates `balanceOf`, `totalSupply`, `decimals`, `name`, and `symbol`
 /// by reading native balances directly from state.
-pub fn eth_erc20_handle<DB: DatabaseRef>(state: &DB, input: Option<&[u8]>) -> SingleCallResult {
+pub fn eth_erc20_handle<DB: Database>(state: &mut DB, input: Option<&[u8]>) -> SingleCallResult {
     let Some(data) = input else {
         return SingleCallResult {
             code: MultiCallErrorCode::CodeTxArgs as i32,
@@ -46,7 +46,7 @@ pub fn eth_erc20_handle<DB: DatabaseRef>(state: &DB, input: Option<&[u8]>) -> Si
             addr_bytes.copy_from_slice(&data[16..36]);
             let user_addr = Address::from(addr_bytes);
             let balance = state
-                .basic_ref(user_addr)
+                .get_account(&user_addr)
                 .ok()
                 .flatten()
                 .map(|acc| acc.balance)
@@ -91,7 +91,7 @@ pub fn eth_erc20_handle<DB: DatabaseRef>(state: &DB, input: Option<&[u8]>) -> Si
 mod tests {
     use super::*;
     use alloy_primitives::U256;
-    use revm::state::AccountInfo;
+    use evm2::evm::AccountInfo;
     use std::collections::HashMap;
 
     /// Minimal in-memory DB for testing.
@@ -117,25 +117,25 @@ mod tests {
         }
     }
 
-    impl DatabaseRef for MockDb {
+    impl Database for MockDb {
         type Error = std::convert::Infallible;
 
-        fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
-            Ok(self.accounts.get(&address).cloned())
+        fn get_account(&mut self, address: &Address) -> Result<Option<AccountInfo>, Self::Error> {
+            Ok(self.accounts.get(address).cloned())
         }
 
-        fn code_by_hash_ref(
-            &self,
-            _: alloy_primitives::B256,
-        ) -> Result<revm::bytecode::Bytecode, Self::Error> {
+        fn get_code_by_hash(
+            &mut self,
+            _: &alloy_primitives::B256,
+        ) -> Result<evm2::bytecode::Bytecode, Self::Error> {
             Ok(Default::default())
         }
 
-        fn storage_ref(&self, _: Address, _: U256) -> Result<U256, Self::Error> {
+        fn get_storage(&mut self, _: &Address, _: &U256) -> Result<U256, Self::Error> {
             Ok(U256::ZERO)
         }
 
-        fn block_hash_ref(&self, _: u64) -> Result<alloy_primitives::B256, Self::Error> {
+        fn get_block_hash(&mut self, _: &U256) -> Result<alloy_primitives::B256, Self::Error> {
             Ok(Default::default())
         }
     }
@@ -157,7 +157,7 @@ mod tests {
         input.extend_from_slice(&[0u8; 12]);
         input.extend_from_slice(user.as_slice());
 
-        let res = eth_erc20_handle(&db, Some(&input));
+        let res = eth_erc20_handle(&mut db, Some(&input));
         assert_eq!(res.code, SUCCESS);
         let balance = U256::from_be_slice(&res.result);
         assert_eq!(balance, U256::from(42_000_000_000_000_000_000u128));
@@ -165,24 +165,24 @@ mod tests {
 
     #[test]
     fn balance_of_unknown_account_returns_zero() {
-        let db = MockDb::new();
+        let mut db = MockDb::new();
         let mut input = vec![0x70, 0xa0, 0x82, 0x31];
         input.extend_from_slice(&[0u8; 12]);
         input.extend_from_slice(&[0xaa; 20]);
 
-        let res = eth_erc20_handle(&db, Some(&input));
+        let res = eth_erc20_handle(&mut db, Some(&input));
         assert_eq!(res.code, SUCCESS);
         assert_eq!(U256::from_be_slice(&res.result), U256::ZERO);
     }
 
     #[test]
     fn balance_of_input_too_short() {
-        let db = MockDb::new();
+        let mut db = MockDb::new();
         // selector + only 10 bytes (need 32)
         let input = vec![
             0x70, 0xa0, 0x82, 0x31, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         ];
-        let res = eth_erc20_handle(&db, Some(&input));
+        let res = eth_erc20_handle(&mut db, Some(&input));
         assert_eq!(res.code, ERR_ARGS);
         assert!(res.err.contains("too short"));
     }
@@ -198,7 +198,7 @@ mod tests {
         input.extend_from_slice(user.as_slice());
         input.extend_from_slice(&[0xff; 32]); // extra trailing data
 
-        let res = eth_erc20_handle(&db, Some(&input));
+        let res = eth_erc20_handle(&mut db, Some(&input));
         assert_eq!(res.code, SUCCESS);
         assert_eq!(U256::from_be_slice(&res.result), U256::from(1u64));
     }
@@ -207,9 +207,9 @@ mod tests {
 
     #[test]
     fn total_supply_returns_one() {
-        let db = MockDb::new();
+        let mut db = MockDb::new();
         let input = [0x18, 0x16, 0x0d, 0xdd];
-        let res = eth_erc20_handle(&db, Some(&input));
+        let res = eth_erc20_handle(&mut db, Some(&input));
         assert_eq!(res.code, SUCCESS);
         assert_eq!(U256::from_be_slice(&res.result), U256::from(1u32));
     }
@@ -218,9 +218,9 @@ mod tests {
 
     #[test]
     fn decimals_returns_18() {
-        let db = MockDb::new();
+        let mut db = MockDb::new();
         let input = [0x31, 0x3c, 0xe5, 0x67];
-        let res = eth_erc20_handle(&db, Some(&input));
+        let res = eth_erc20_handle(&mut db, Some(&input));
         assert_eq!(res.code, SUCCESS);
         assert_eq!(U256::from_be_slice(&res.result), U256::from(18u32));
     }
@@ -229,9 +229,9 @@ mod tests {
 
     #[test]
     fn name_returns_eth() {
-        let db = MockDb::new();
+        let mut db = MockDb::new();
         let input = [0x06, 0xfd, 0xde, 0x03];
-        let res = eth_erc20_handle(&db, Some(&input));
+        let res = eth_erc20_handle(&mut db, Some(&input));
         assert_eq!(res.code, SUCCESS);
         let decoded = sol_data::String::abi_decode(&res.result).unwrap();
         assert_eq!(decoded, "ETH");
@@ -239,9 +239,9 @@ mod tests {
 
     #[test]
     fn symbol_returns_eth() {
-        let db = MockDb::new();
+        let mut db = MockDb::new();
         let input = [0x95, 0xd8, 0x9b, 0x41];
-        let res = eth_erc20_handle(&db, Some(&input));
+        let res = eth_erc20_handle(&mut db, Some(&input));
         assert_eq!(res.code, SUCCESS);
         let decoded = sol_data::String::abi_decode(&res.result).unwrap();
         assert_eq!(decoded, "ETH");
@@ -251,25 +251,25 @@ mod tests {
 
     #[test]
     fn none_input_returns_error() {
-        let db = MockDb::new();
-        let res = eth_erc20_handle(&db, None);
+        let mut db = MockDb::new();
+        let res = eth_erc20_handle(&mut db, None);
         assert_eq!(res.code, ERR_ARGS);
         assert!(res.err.contains("missing"));
     }
 
     #[test]
     fn short_input_less_than_4_bytes() {
-        let db = MockDb::new();
-        let res = eth_erc20_handle(&db, Some(&[0x70, 0xa0]));
+        let mut db = MockDb::new();
+        let res = eth_erc20_handle(&mut db, Some(&[0x70, 0xa0]));
         assert_eq!(res.code, ERR_ARGS);
         assert!(res.err.contains("less than 4"));
     }
 
     #[test]
     fn unknown_selector_returns_not_found() {
-        let db = MockDb::new();
+        let mut db = MockDb::new();
         let input = [0xde, 0xad, 0xbe, 0xef];
-        let res = eth_erc20_handle(&db, Some(&input));
+        let res = eth_erc20_handle(&mut db, Some(&input));
         assert_eq!(res.code, ERR_NOT_FOUND);
     }
 }
