@@ -4,7 +4,7 @@
 //! and state diffs for consumption by background-tracer → S3/Kafka → leafage-evm.
 
 use alloy_consensus::{BlockHeader, Transaction, TxReceipt, transaction::TxHashRef};
-use alloy_eips::BlockId;
+use alloy_eips::{BlockId, Typed2718};
 use alloy_primitives::{Address, B256, U256, keccak256};
 use alloy_rpc_types_eth::Header;
 use evm2::{
@@ -12,9 +12,7 @@ use evm2::{
     evm::Db,
     interpreter::{Interpreter, Message, MessageKind, MessageResult, opcode::OpCode},
 };
-use evm2_inspectors::tracing::{
-    CallTraceArena, OpcodeFilter, TracingInspector, TracingInspectorConfig,
-};
+use evm2_inspectors::tracing::{CallTraceArena, OpcodeFilter, TracingInspectorConfig};
 use jsonrpsee::core::RpcResult;
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_errors::{BlockExecutionError, RethError};
@@ -41,7 +39,7 @@ use tempo_evm::{TempoEvmConfig, TempoEvmTypes};
 use tempo_precompiles::storage::StorageActions;
 use tempo_primitives::transaction::Call;
 
-use crate::debank_trace::*;
+use crate::{debank_trace::*, tracing::RpcTracingInspector};
 
 #[derive(Debug)]
 struct NativeCallFrame {
@@ -105,7 +103,7 @@ impl NativeStorageChangeInspector {
 
 #[derive(Debug)]
 struct DebankInspectorState {
-    trace: TracingInspector,
+    trace: RpcTracingInspector,
     native: NativeStorageChangeInspector,
 }
 
@@ -126,7 +124,7 @@ impl Inspector<TempoEvmTypes> for DebankInspector {
     }
 
     fn log(&mut self, log: &alloy_primitives::Log, host: &mut tempo_evm::TempoEvm<'_>) {
-        <TracingInspector as Inspector<TempoEvmTypes>>::log(
+        <RpcTracingInspector as Inspector<TempoEvmTypes>>::log(
             &mut self.0.borrow_mut().trace,
             log,
             host,
@@ -189,7 +187,7 @@ impl Inspector<TempoEvmTypes> for DebankInspector {
         value: &U256,
         host: &mut tempo_evm::TempoEvm<'_>,
     ) {
-        <TracingInspector as Inspector<TempoEvmTypes>>::selfdestruct(
+        <RpcTracingInspector as Inspector<TempoEvmTypes>>::selfdestruct(
             &mut self.0.borrow_mut().trace,
             contract,
             target,
@@ -207,19 +205,17 @@ fn new_debank_inspector(actions: StorageActions) -> DebankInspectorState {
         .set_exclude_precompile_calls(false);
     trace_cfg.record_opcodes_filter = Some(OpcodeFilter::new().enabled(OpCode::SSTORE));
     DebankInspectorState {
-        trace: TracingInspector::new(trace_cfg),
+        trace: RpcTracingInspector::new(trace_cfg, false),
         native: NativeStorageChangeInspector::new(actions),
     }
 }
 
 /// Aligns native inspector calls with tracing arena nodes.
 ///
-/// Standard transactions enter the EVM at journal depth zero, so the first inspector call fills
-/// arena node zero and both inspectors have the same number of records. Tempo AA transactions
-/// execute their calls at depth one under a synthetic transaction root. `TracingInspector` keeps
-/// its preallocated node zero for that root, but no `Inspector::call` callback exists for it. The
-/// only accepted offset is therefore one verified synthetic root followed by an exact address
-/// match for every real call/create frame.
+/// Standard transactions fill arena node zero. For AA transactions RpcTracingInspector adds
+/// the deployed protocol's synthetic transaction root and offsets the recorded call depths.
+/// Native writes only track real calls, so accept that one verified root before requiring an
+/// exact address match for every real call/create frame.
 fn align_native_storage_changes(
     arena: &mut CallTraceArena,
     native_changes: Vec<(Address, NativeStorageWrites)>,
@@ -732,16 +728,17 @@ where
                 for (idx, tx) in block.transactions_recovered().enumerate() {
                     let tx_hash = tx_hashes[idx];
 
+                    inspector_state.borrow_mut().trace.set_aa(tx.ty() == 0x76);
                     let output = executor
                         .execute_transaction_without_commit(tx)
                         .map_err(Eth::Error::from_eth_err)?;
 
                     let DebankInspectorState { trace: mut inspector, native: native_storage_inspector } =
                         inspector_state.replace(new_debank_inspector(storage_actions.clone()));
-                    inspector.set_transaction_gas_limit(tx.gas_limit());
-                    inspector.set_transaction_gas_used(tx_gas_used[idx]);
-                    inspector.set_transaction_caller(Address::from(*tx.signer()));
-                    let mut arena = inspector.into_traces();
+                    inspector.inner.set_transaction_gas_limit(tx.gas_limit());
+                    inspector.inner.set_transaction_gas_used(tx_gas_used[idx]);
+                    inspector.inner.set_transaction_caller(Address::from(*tx.signer()));
+                    let mut arena = inspector.inner.into_traces();
                     let raw_native_storage_changes = native_storage_inspector.into_changes();
                     let trace_node_count = arena.nodes().len();
                     let native_frame_count = raw_native_storage_changes.len();
@@ -879,7 +876,10 @@ where
 
                 Ok((all_results, canonical_state_diff, change_addresses))
             })
-            .await?;
+            .await
+            .inspect_err(|error| {
+                tracing::error!(target: "debank_rpc", ?error, "block trace replay failed");
+            })?;
 
         // Assemble block file.
         // Classification uses per-node success from build_debank_traces, with
@@ -1134,7 +1134,7 @@ mod tests {
         storage_actions.clear();
         let inspector_state = Rc::new(RefCell::new(new_debank_inspector(storage_actions.clone())));
         evm.set_inspector(DebankInspector(inspector_state.clone()));
-        let mut trace_call = |to: Address, data: Bytes| {
+        let mut trace_call = |to: Address, data: Bytes, aa: bool| {
             let tx = Signed::new_unchecked(
                 TxLegacy {
                     chain_id: Some(1),
@@ -1147,9 +1147,39 @@ mod tests {
                 Signature::test_signature(),
                 B256::ZERO,
             );
-            let tx_env: TempoTxEnv =
-                Recovered::new_unchecked(tempo_primitives::TempoTxEnvelope::Legacy(tx), sender)
-                    .into();
+            let envelope = if aa {
+                use tempo_primitives::{
+                    AASigned, TempoSignature, TempoTransaction,
+                    transaction::tt_signature::PrimitiveSignature,
+                };
+                tempo_primitives::TempoTxEnvelope::AA(AASigned::new_unhashed(
+                    TempoTransaction {
+                        chain_id: 1,
+                        gas_limit: 1_000_000,
+                        fee_token: Some(PATH_USD_ADDRESS),
+                        calls: vec![
+                            Call {
+                                to: TxKind::Call(to),
+                                input: tx.tx().input.clone(),
+                                value: U256::ZERO,
+                            },
+                            Call {
+                                to: TxKind::Call(sstore_contract),
+                                input: Bytes::new(),
+                                value: U256::ZERO,
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                    TempoSignature::Primitive(PrimitiveSignature::Secp256k1(
+                        Signature::test_signature(),
+                    )),
+                ))
+            } else {
+                tempo_primitives::TempoTxEnvelope::Legacy(tx)
+            };
+            let tx_env: TempoTxEnv = Recovered::new_unchecked(envelope, sender).into();
+            inspector_state.borrow_mut().trace.set_aa(aa);
             let result = evm
                 .transact(&Recovered::new_unchecked(tx_env, sender))
                 .unwrap()
@@ -1160,9 +1190,12 @@ mod tests {
                 native,
             } = inspector_state.replace(new_debank_inspector(storage_actions.clone()));
             storage_actions.clear();
-            let mut arena = inspector.into_traces();
+            let mut arena = inspector.inner.into_traces();
+            let raw_changes = native.into_changes();
             let native_changes =
-                align_native_storage_changes(&mut arena, native.into_changes(), true).unwrap();
+                align_native_storage_changes(&mut arena, raw_changes.clone(), true).unwrap_or_else(
+                    || panic!("native {raw_changes:?}, traces {:?}", arena.nodes()),
+                );
             let (traces, error_traces, _, _) = build_debank_traces(
                 B256::ZERO,
                 arena,
@@ -1170,8 +1203,8 @@ mod tests {
                 &std::cell::RefCell::new(0),
             );
             assert!(error_traces.is_empty());
-            assert_eq!(traces.len(), 1);
-            traces.into_iter().next().unwrap()
+            assert_eq!(traces.len(), if aa { 3 } else { 1 });
+            traces
         };
 
         // A TIP-20 transfer writes the token's own balances natively, without an SSTORE. TIP-20
@@ -1184,14 +1217,35 @@ mod tests {
             }
             .abi_encode()
             .into(),
+            false,
         );
-        assert!(transfer.self_storage_change);
-        assert!(transfer.storage_change);
+        assert!(transfer[0].self_storage_change);
+        assert!(transfer[0].storage_change);
 
         // SSTORE flags of an EVM frame must survive merging its (empty) native writes.
-        let sstore = trace_call(sstore_contract, Bytes::new());
-        assert!(sstore.self_storage_change);
-        assert!(sstore.storage_change);
+        let sstore = trace_call(sstore_contract, Bytes::new(), false);
+        assert!(sstore[0].self_storage_change);
+        assert!(sstore[0].storage_change);
+
+        // Both top-level AA calls must survive under one synthetic transaction root.
+        let aa = trace_call(
+            PATH_USD_ADDRESS,
+            ITIP20::transferCall {
+                to: recipient,
+                amount: U256::from(100),
+            }
+            .abi_encode()
+            .into(),
+            true,
+        );
+        assert!(aa[0].trace_address.is_empty());
+        assert_eq!(aa[0].subtraces, 2);
+        assert_eq!(aa[1].trace_address, vec![0]);
+        assert_eq!(aa[1].to_addr, PATH_USD_ADDRESS);
+        assert!(aa[1].self_storage_change);
+        assert_eq!(aa[2].trace_address, vec![1]);
+        assert_eq!(aa[2].to_addr, sstore_contract);
+        assert!(aa[2].self_storage_change);
     }
 
     #[test]

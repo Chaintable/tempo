@@ -12,6 +12,7 @@ pub mod erc20_handle;
 pub mod multi_call;
 pub mod pre;
 pub mod trace_block;
+mod tracing;
 pub mod types;
 
 // Re-export key types for registration
