@@ -1195,7 +1195,7 @@ mod tests {
             balance: U256::from(20),
             nonce: 2,
             code_hash,
-            code: Some(code.clone()),
+            code: None,
             ..Default::default()
         };
         let cloned = AccountInfo {
@@ -1225,7 +1225,7 @@ mod tests {
                         balance: U256::from(30),
                         nonce: 1,
                         code_hash,
-                        code: Some(code),
+                        code: None,
                         ..Default::default()
                     }),
                     [(recreated_slot, (U256::from(7), U256::from(7)))]
@@ -1235,7 +1235,7 @@ mod tests {
                 (deleted, Some(original), None, Default::default()),
             ],
             std::iter::empty::<Vec<(Address, Option<Option<AccountInfo>>, Vec<(U256, U256)>)>>(),
-            std::iter::empty::<(H256, Bytecode)>(),
+            [(code_hash, code.clone())],
         );
         bundle.state.get_mut(&recreated).unwrap().status = AccountStatus::DestroyedChanged;
 
@@ -1244,7 +1244,9 @@ mod tests {
             vec![changed, recreated]
         );
 
+        // EVM2 stores deployed bytecode in the bundle table, not in account info.
         let mut post_db = InMemoryDB::new(EmptyDB::default());
+        post_db.cache.contracts.insert(code_hash, code);
         for address in [changed, clone, recreated] {
             post_db.insert_account_info(&address, bundle.state[&address].info.clone().unwrap());
         }
