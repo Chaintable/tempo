@@ -24,9 +24,6 @@ Chaintable background-tracer (separate process)
 <!-- Generated from README.md.template and the network identity JSON files.
 Edit the template or JSON files, then run: uv run --no-project python scripts/generate_readme.py -->
 
-<br>
-<br>
-
 <p align="center">
   <a href="https://tempo.xyz">
     <picture>
@@ -35,9 +32,6 @@ Edit the template or JSON files, then run: uv run --no-project python scripts/ge
     </picture>
   </a>
 </p>
-
-<br>
-<br>
 
 # Tempo
 

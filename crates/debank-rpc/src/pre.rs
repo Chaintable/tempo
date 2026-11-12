@@ -1,7 +1,9 @@
 use alloy_consensus::BlockHeader;
-use alloy_eips::BlockId;
+use alloy_eips::{BlockId, Typed2718};
 use alloy_primitives::B256;
 use alloy_rpc_types_eth::{BlockOverrides, Log, TransactionInfo, state::StateOverride};
+use evm2::evm::StateChangeSource;
+use evm2_inspectors::tracing::TracingInspectorConfig;
 use jsonrpsee::core::RpcResult;
 use reth_evm::EvmEnvFor;
 use reth_rpc_convert::RpcTxReq;
@@ -10,10 +12,11 @@ use reth_rpc_eth_api::{
     helpers::{EthTransactions, TraceExt},
 };
 use reth_rpc_eth_types::{EthApiError, StateCacheDb};
-use revm::{DatabaseCommit, context::result::ResultAndState};
-use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
 
-use crate::types::{PreError, PreErrorCode, PreResult};
+use crate::{
+    tracing::RpcTracingInspector,
+    types::{PreError, PreErrorCode, PreResult},
+};
 
 /// `pre` namespace API implementation.
 #[derive(Clone)]
@@ -42,58 +45,57 @@ where
         block_timestamp: u64,
     ) -> PreResult {
         let result: Result<PreResult, PreError> = (|| {
-            let mut inspector = TracingInspector::new(TracingInspectorConfig::default_parity());
-
-            // Execute with inspector, then commit state changes so subsequent txs see effects.
-            let ResultAndState { result, state } = self
+            let inspector = RpcTracingInspector::new(
+                TracingInspectorConfig::default_parity(),
+                tx_env.ty() == 0x76,
+            );
+            let (inspector, output) = self
                 .eth_api
-                .inspect(&mut *db, evm_env, tx_env, &mut inspector)
+                .inspect(&mut *db, evm_env, &tx_env, inspector)
                 .map_err(|e| PreError {
                     code: PreErrorCode::UnKnown as i64,
                     msg: e.to_string(),
                 })?;
-            db.commit(state);
-
-            match result {
-                revm::context::result::ExecutionResult::Success {
-                    gas,
-                    logs: exec_logs,
-                    ..
-                } => {
-                    let traces = inspector
-                        .into_parity_builder()
-                        .into_localized_transaction_traces(tx_info);
-
-                    let logs: Vec<Log> = exec_logs
-                        .into_iter()
-                        .enumerate()
-                        .map(|(i, log)| Log {
-                            inner: log,
-                            block_hash: tx_info.block_hash,
-                            block_number: tx_info.block_number,
-                            block_timestamp: Some(block_timestamp),
-                            transaction_hash: tx_info.hash,
-                            transaction_index: tx_info.index,
-                            log_index: Some(i as u64),
-                            removed: false,
-                        })
-                        .collect();
-
-                    Ok(PreResult {
-                        trace: traces,
-                        logs,
-                        error: None,
-                        gas_used: gas.tx_gas_used(),
+            // Commit even failed execution's retained nonce/fee changes, as before.
+            let Ok(()) = output.pending_state.visit(db);
+            let result = output.result;
+            if result.is_success() {
+                let gas_used = result.tx_gas_used();
+                let traces = inspector
+                    .inner
+                    .into_parity_builder()
+                    .into_localized_transaction_traces(tx_info);
+                let logs = result
+                    .logs
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, log)| Log {
+                        inner: log,
+                        block_hash: tx_info.block_hash,
+                        block_number: tx_info.block_number,
+                        block_timestamp: Some(block_timestamp),
+                        transaction_hash: tx_info.hash,
+                        transaction_index: tx_info.index,
+                        log_index: Some(i as u64),
+                        removed: false,
                     })
-                }
-                revm::context::result::ExecutionResult::Halt { reason, .. } => Err(PreError {
-                    code: PreErrorCode::InsufficientBalance as i64,
-                    msg: format!("halt: {reason:?}"),
-                }),
-                revm::context::result::ExecutionResult::Revert { .. } => Err(PreError {
+                    .collect();
+                Ok(PreResult {
+                    trace: traces,
+                    logs,
+                    error: None,
+                    gas_used,
+                })
+            } else if result.is_revert() {
+                Err(PreError {
                     code: PreErrorCode::Reverted as i64,
                     msg: "revert".to_string(),
-                }),
+                })
+            } else {
+                Err(PreError {
+                    code: PreErrorCode::InsufficientBalance as i64,
+                    msg: format!("halt: {:?}", result.stop),
+                })
             }
         })();
 

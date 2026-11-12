@@ -4,16 +4,23 @@
 //! and state diffs for consumption by background-tracer → S3/Kafka → leafage-evm.
 
 use alloy_consensus::{BlockHeader, Transaction, TxReceipt, transaction::TxHashRef};
-use alloy_eips::BlockId;
+use alloy_eips::{BlockId, Typed2718};
 use alloy_primitives::{Address, B256, U256, keccak256};
 use alloy_rpc_types_eth::Header;
+use evm2::{
+    Inspector,
+    evm::Db,
+    interpreter::{Interpreter, Message, MessageKind, MessageResult, opcode::OpCode},
+};
+use evm2_inspectors::tracing::{CallTraceArena, OpcodeFilter, TracingInspectorConfig};
 use jsonrpsee::core::RpcResult;
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_errors::{BlockExecutionError, RethError};
-use reth_evm::{ConfigureEvm, Evm, execute::BlockExecutor};
+use reth_evm::{
+    BlockExecutorFactory, ConfigureEvm, database::StateProviderDatabase, execute::BlockExecutor,
+};
 use reth_primitives_traits::BlockBody;
 use reth_provider::ChainSpecProvider;
-use reth_revm::{State, database::StateProviderDatabase};
 use reth_rpc_eth_api::{
     EthApiTypes, FromEthApiError, RpcNodeCore,
     helpers::{
@@ -22,42 +29,33 @@ use reth_rpc_eth_api::{
 };
 use reth_rpc_eth_types::EthApiError;
 use reth_storage_api::{ChangeSetReader, StateProvider, StorageChangeSetReader};
-use revm::{
-    Database, Inspector, JournalEntry,
-    bytecode::opcode::OpCode,
-    context::{ContextTr, JournalTr},
-    database::states::bundle_state::BundleRetention,
-    interpreter::{CallInputs, CallOutcome, CallScheme, CreateInputs, CreateOutcome},
-};
-use revm_inspectors::tracing::{
-    CallTraceArena, OpcodeFilter, TracingInspector, TracingInspectorConfig,
-};
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet, VecDeque},
-    mem,
+    rc::Rc,
     str::FromStr,
 };
-use tempo_evm::TempoEvmConfig;
+use tempo_evm::{TempoEvmConfig, TempoEvmTypes};
 use tempo_precompiles::storage::StorageActions;
 use tempo_primitives::transaction::Call;
-use tempo_revm::evm::TempoContext;
 
-use crate::debank_trace::*;
+use crate::{debank_trace::*, tracing::RpcTracingInspector};
 
-type DebankInspector = (TracingInspector, NativeStorageChangeInspector);
+fn trace_execution_error<E: FromEthApiError>(error: BlockExecutionError) -> E {
+    // FromEthApiError erases block-execution details into InternalEthError.
+    tracing::error!(target: "debank_rpc", ?error, "block trace execution or validation failed");
+    E::from_eth_err(error)
+}
 
 #[derive(Debug)]
 struct NativeCallFrame {
     change_index: usize,
-    journal_start: usize,
     action_cursor: usize,
+    is_precompile: bool,
 }
 
-/// Records storage writes performed inside native precompile frames.
-///
-/// Native precompiles write through the journal directly, so they do not execute an SSTORE opcode
-/// that [`TracingInspector`] can attach to a call trace. Call records are kept in the same
-/// insertion order as real tracing arena nodes and merged into the DeBank trace after execution.
+/// Attributes native writes to the same frames as the call-tree inspector.
+/// StorageActions records writes even when a later call revert rolls them back.
 #[derive(Debug)]
 struct NativeStorageChangeInspector {
     frames: Vec<NativeCallFrame>,
@@ -80,42 +78,27 @@ impl NativeStorageChangeInspector {
         }
     }
 
-    fn start_frame<DB: Database>(&mut self, context: &TempoContext<DB>, address: Address) {
+    fn start_frame(&mut self, address: Address, is_precompile: bool) {
         let change_index = self.changes.len();
         self.changes.push((address, NativeStorageWrites::default()));
         self.frames.push(NativeCallFrame {
             change_index,
-            journal_start: context.journaled_state.journal.len(),
             action_cursor: self.actions.cursor(),
+            is_precompile,
         });
     }
 
-    fn finish_frame<DB: Database>(&mut self, context: &TempoContext<DB>, is_precompile: bool) {
+    fn finish_frame(&mut self) {
         let Some(frame) = self.frames.pop() else {
             return;
         };
-        if !is_precompile {
+        if !frame.is_precompile {
             return;
         }
-
-        // Tempo precompiles only accept direct calls, so the frame address is the account whose
-        // storage the precompile owns. Storage actions survive a journal revert, so writes of a
-        // failed call are still attributed, like an SSTORE executed before a revert.
-        let (frame_address, writes) = &mut self.changes[frame.change_index];
-        let journal_writes = context
-            .journaled_state
-            .journal
-            .get(frame.journal_start..)
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|entry| match entry {
-                JournalEntry::StorageChanged { address, .. } => Some(*address),
-                _ => None,
-            });
-        for written in journal_writes.chain(self.actions.storage_writes_since(frame.action_cursor))
-        {
+        let (address, writes) = &mut self.changes[frame.change_index];
+        for written in self.actions.storage_writes_since(frame.action_cursor) {
             writes.any = true;
-            writes.own |= written == *frame_address;
+            writes.own |= written == *address;
         }
     }
 
@@ -124,79 +107,121 @@ impl NativeStorageChangeInspector {
     }
 }
 
-impl<DB: Database> Inspector<TempoContext<DB>> for NativeStorageChangeInspector {
+#[derive(Debug)]
+struct DebankInspectorState {
+    trace: RpcTracingInspector,
+    native: NativeStorageChangeInspector,
+}
+
+#[derive(Debug, Clone)]
+struct DebankInspector(Rc<RefCell<DebankInspectorState>>);
+
+impl Inspector<TempoEvmTypes> for DebankInspector {
+    fn initialize_interp(&mut self, interp: &mut Interpreter<'_, '_, TempoEvmTypes>) {
+        self.0.borrow_mut().trace.initialize_interp(interp);
+    }
+
+    fn step(&mut self, interp: &mut Interpreter<'_, '_, TempoEvmTypes>) {
+        self.0.borrow_mut().trace.step(interp);
+    }
+
+    fn step_end(&mut self, interp: &mut Interpreter<'_, '_, TempoEvmTypes>) {
+        self.0.borrow_mut().trace.step_end(interp);
+    }
+
+    fn log(&mut self, log: &alloy_primitives::Log, host: &mut tempo_evm::TempoEvm<'_>) {
+        <RpcTracingInspector as Inspector<TempoEvmTypes>>::log(
+            &mut self.0.borrow_mut().trace,
+            log,
+            host,
+        );
+    }
+
     fn call(
         &mut self,
-        context: &mut TempoContext<DB>,
-        inputs: &mut CallInputs,
-    ) -> Option<CallOutcome> {
-        let address = match inputs.scheme {
-            CallScheme::DelegateCall | CallScheme::CallCode => inputs.bytecode_address,
-            _ => inputs.target_address,
+        interp: &mut Interpreter<'_, '_, TempoEvmTypes>,
+        message: &mut Message<TempoEvmTypes>,
+    ) -> Option<MessageResult<TempoEvmTypes>> {
+        let mut state = self.0.borrow_mut();
+        let result = state.trace.call(interp, message);
+        let address = match message.kind {
+            MessageKind::DelegateCall | MessageKind::CallCode => message.call_target,
+            _ => message.destination,
         };
-        self.start_frame(context, address);
-        None
+        let is_precompile = interp.host().precompiles().contains(&message.call_target);
+        state.native.start_frame(address, is_precompile);
+        result
     }
 
     fn call_end(
         &mut self,
-        context: &mut TempoContext<DB>,
-        _inputs: &CallInputs,
-        outcome: &mut CallOutcome,
+        interp: &mut Interpreter<'_, '_, TempoEvmTypes>,
+        message: &Message<TempoEvmTypes>,
+        result: &mut MessageResult<TempoEvmTypes>,
     ) {
-        // revm sets this when a precompile served the call, including the Tempo precompiles
-        // registered through the precompile lookup. The journal's warm precompile set only holds
-        // the statically registered Ethereum precompiles and cannot identify them.
-        self.finish_frame(context, outcome.was_precompile_called);
+        let mut state = self.0.borrow_mut();
+        state.trace.call_end(interp, message, result);
+        state.native.finish_frame();
     }
 
     fn create(
         &mut self,
-        context: &mut TempoContext<DB>,
-        inputs: &mut CreateInputs,
-    ) -> Option<CreateOutcome> {
-        // TracingInspector runs first in the inspector tuple and has already loaded the caller.
-        // Repeat the lookup to derive the same address and preserve one-to-one arena ordering.
-        let nonce = context
-            .journal_mut()
-            .load_account(inputs.caller())
-            .ok()?
-            .info
-            .nonce;
-        self.start_frame(context, inputs.created_address(nonce));
-        None
+        interp: &mut Interpreter<'_, '_, TempoEvmTypes>,
+        message: &mut Message<TempoEvmTypes>,
+    ) -> Option<MessageResult<TempoEvmTypes>> {
+        let mut state = self.0.borrow_mut();
+        let result = state.trace.create(interp, message);
+        state.native.start_frame(message.destination, false);
+        result
     }
 
     fn create_end(
         &mut self,
-        context: &mut TempoContext<DB>,
-        _inputs: &CreateInputs,
-        _outcome: &mut CreateOutcome,
+        interp: &mut Interpreter<'_, '_, TempoEvmTypes>,
+        message: &Message<TempoEvmTypes>,
+        result: &mut MessageResult<TempoEvmTypes>,
     ) {
-        self.finish_frame(context, false);
+        let mut state = self.0.borrow_mut();
+        state.trace.create_end(interp, message, result);
+        state.native.finish_frame();
+    }
+
+    fn selfdestruct(
+        &mut self,
+        contract: &Address,
+        target: &Address,
+        value: &U256,
+        host: &mut tempo_evm::TempoEvm<'_>,
+    ) {
+        <RpcTracingInspector as Inspector<TempoEvmTypes>>::selfdestruct(
+            &mut self.0.borrow_mut().trace,
+            contract,
+            target,
+            value,
+            host,
+        );
     }
 }
 
-fn new_debank_inspector(actions: StorageActions) -> DebankInspector {
+fn new_debank_inspector(actions: StorageActions) -> DebankInspectorState {
     let mut trace_cfg = TracingInspectorConfig::default_parity()
         .set_steps(true)
+        .set_step_deltas(true)
         .set_record_logs(true)
         .set_exclude_precompile_calls(false);
     trace_cfg.record_opcodes_filter = Some(OpcodeFilter::new().enabled(OpCode::SSTORE));
-    (
-        TracingInspector::new(trace_cfg),
-        NativeStorageChangeInspector::new(actions),
-    )
+    DebankInspectorState {
+        trace: RpcTracingInspector::new(trace_cfg, false),
+        native: NativeStorageChangeInspector::new(actions),
+    }
 }
 
 /// Aligns native inspector calls with tracing arena nodes.
 ///
-/// Standard transactions enter the EVM at journal depth zero, so the first inspector call fills
-/// arena node zero and both inspectors have the same number of records. Tempo AA transactions
-/// execute their calls at depth one under a synthetic transaction root. `TracingInspector` keeps
-/// its preallocated node zero for that root, but no `Inspector::call` callback exists for it. The
-/// only accepted offset is therefore one verified synthetic root followed by an exact address
-/// match for every real call/create frame.
+/// Standard transactions fill arena node zero. For AA transactions RpcTracingInspector adds
+/// the deployed protocol's synthetic transaction root and offsets the recorded call depths.
+/// Native writes only track real calls, so accept that one verified root before requiring an
+/// exact address match for every real call/create frame.
 fn align_native_storage_changes(
     arena: &mut CallTraceArena,
     native_changes: Vec<(Address, NativeStorageWrites)>,
@@ -537,12 +562,14 @@ where
 
         let block_txs = BlockBody::transactions(block.body());
         if receipts.len() != block_txs.len() {
-            return Err(Eth::Error::from_eth_err(BlockExecutionError::msg(format!(
-                "trace_debankBlock receipt count mismatch for block {}: receipts {}, transactions {}",
-                block.number(),
-                receipts.len(),
-                block_txs.len(),
-            ))));
+            return Err(trace_execution_error::<Eth::Error>(
+                BlockExecutionError::msg(format!(
+                    "trace_debankBlock receipt count mismatch for block {}: receipts {}, transactions {}",
+                    block.number(),
+                    receipts.len(),
+                    block_txs.len(),
+                )),
+            ));
         }
         let mut debank_txs: Vec<DebankTransaction> = Vec::with_capacity(block_txs.len());
 
@@ -670,19 +697,16 @@ where
                 let post_state = eth_api
                     .state_at_block_id(BlockId::hash(block.hash()))
                     .await?;
-                let mut replay_state = State::builder()
-                    .with_database(StateProviderDatabase::new(
-                        parent_state.into_evm_state_provider(),
-                    ))
-                    .with_bundle_update()
-                    .build();
-
-                let evm = eth_api
-                    .evm_config()
-                    .evm_with_env(&mut replay_state, evm_env)
-                    .with_actions();
-                let storage_actions = evm.storage_actions();
-                let evm = evm.with_inspector(new_debank_inspector(storage_actions));
+                let mut replay_database = StateProviderDatabase::new(parent_state.into_evm_state_provider());
+                let mut evm = BlockExecutorFactory::evm_with_env(eth_api.evm_config(), Db::new(&mut replay_database), evm_env);
+                let storage_actions = StorageActions::enabled();
+                evm.ext_mut().actions = storage_actions.clone();
+                let non_creditable_slots = evm.ext_mut().non_creditable_slots.clone();
+                evm.set_precompiles(tempo_precompiles::TempoPrecompiles::new(
+                    evm.config_spec_id(), storage_actions.clone(), non_creditable_slots,
+                ));
+                let inspector_state = Rc::new(RefCell::new(new_debank_inspector(storage_actions.clone())));
+                evm.set_inspector(DebankInspector(inspector_state.clone()));
                 let execution_ctx = eth_api
                     .evm_config()
                     .context_for_block(block.sealed_block())
@@ -691,15 +715,13 @@ where
                 let mut executor = eth_api.evm_config().create_executor(evm, execution_ctx);
                 executor
                     .apply_pre_execution_changes()
-                    .map_err(Eth::Error::from_eth_err)?;
+                    .map_err(trace_execution_error::<Eth::Error>)?;
 
                 // Pre-execution system calls are block-level state changes, not transaction
                 // traces. Discard anything recorded while applying them and start each
                 // transaction with a fresh inspector.
-                executor.evm_mut().clear_actions();
-                let storage_actions = executor.evm_mut().storage_actions();
-                *executor.evm_mut().components_mut().1 =
-                    new_debank_inspector(storage_actions);
+                storage_actions.clear();
+                inspector_state.replace(new_debank_inspector(storage_actions.clone()));
 
                 let mut next_event_index = 0usize;
                 // (traces, error_traces, events, error_events)
@@ -714,18 +736,17 @@ where
                 for (idx, tx) in block.transactions_recovered().enumerate() {
                     let tx_hash = tx_hashes[idx];
 
+                    inspector_state.borrow_mut().trace.set_aa(tx.ty() == 0x76);
                     let output = executor
                         .execute_transaction_without_commit(tx)
-                        .map_err(Eth::Error::from_eth_err)?;
+                        .map_err(trace_execution_error::<Eth::Error>)?;
 
-                    let storage_actions = executor.evm_mut().storage_actions();
-                    let next_inspector = new_debank_inspector(storage_actions);
-                    let (mut inspector, native_storage_inspector) =
-                        mem::replace(executor.evm_mut().components_mut().1, next_inspector);
-                    inspector.set_transaction_gas_limit(tx.gas_limit());
-                    inspector.set_transaction_gas_used(tx_gas_used[idx]);
-                    inspector.set_transaction_caller(Address::from(*tx.signer()));
-                    let mut arena = inspector.into_traces();
+                    let DebankInspectorState { trace: mut inspector, native: native_storage_inspector } =
+                        inspector_state.replace(new_debank_inspector(storage_actions.clone()));
+                    inspector.inner.set_transaction_gas_limit(tx.gas_limit());
+                    inspector.inner.set_transaction_gas_used(tx_gas_used[idx]);
+                    inspector.inner.set_transaction_caller(Address::from(*tx.signer()));
+                    let mut arena = inspector.inner.into_traces();
                     let raw_native_storage_changes = native_storage_inspector.into_changes();
                     let trace_node_count = arena.nodes().len();
                     let native_frame_count = raw_native_storage_changes.len();
@@ -734,7 +755,7 @@ where
                         raw_native_storage_changes,
                         replay_tx_statuses[idx],
                     ) else {
-                        return Err(Eth::Error::from_eth_err(BlockExecutionError::msg(format!(
+                        return Err(trace_execution_error::<Eth::Error>(BlockExecutionError::msg(format!(
                             "trace_debankBlock native inspector mismatch for transaction {tx_hash}: trace nodes {trace_node_count}, native frames {native_frame_count}",
                         ))));
                     };
@@ -747,13 +768,13 @@ where
                             &inspector_log_index,
                         );
 
-                    executor.commit_transaction(output);
-                    executor.evm_mut().clear_actions();
+                    executor.commit_transaction(output).map_err(trace_execution_error::<Eth::Error>)?;
+                    storage_actions.clear();
                     let persisted_events = executor
                         .receipts()
                         .get(idx)
                         .ok_or_else(|| {
-                            Eth::Error::from_eth_err(BlockExecutionError::msg(format!(
+                            trace_execution_error::<Eth::Error>(BlockExecutionError::msg(format!(
                                 "trace_debankBlock missing replayed receipt for transaction {tx_hash}"
                             )))
                         })?
@@ -779,13 +800,12 @@ where
                     all_results.push((traces, error_traces, events, error_events));
                 }
 
-                let (evm, execution_result) = executor
+                let execution_result = executor
                     .finish()
-                    .map_err(Eth::Error::from_eth_err)?;
-                drop(evm);
+                    .map_err(trace_execution_error::<Eth::Error>)?;
 
                 if execution_result.gas_used != block.gas_used() {
-                    return Err(Eth::Error::from_eth_err(BlockExecutionError::msg(format!(
+                    return Err(trace_execution_error::<Eth::Error>(BlockExecutionError::msg(format!(
                         "trace_debankBlock gas mismatch for block {}: replayed {}, header {}",
                         block.number(),
                         execution_result.gas_used,
@@ -801,7 +821,7 @@ where
                 let replayed_receipts_root =
                     alloy_consensus::proofs::calculate_receipt_root(&receipts_with_bloom);
                 if replayed_receipts_root != block.receipts_root() {
-                    return Err(Eth::Error::from_eth_err(BlockExecutionError::msg(format!(
+                    return Err(trace_execution_error::<Eth::Error>(BlockExecutionError::msg(format!(
                         "trace_debankBlock receipts root mismatch for block {}: replayed {}, header {}",
                         block.number(),
                         replayed_receipts_root,
@@ -809,8 +829,7 @@ where
                     ))));
                 }
 
-                replay_state.merge_transitions(BundleRetention::PlainState);
-                let bundle_state = replay_state.take_bundle();
+                let bundle_state = execution_result.state;
                 let change_addresses = get_storage_contracts_from_bundle(&bundle_state);
                 let destroyed_addresses = bundle_state
                     .state
@@ -821,7 +840,7 @@ where
                     })
                     .collect::<HashSet<_>>();
                 let replayed_state_diff =
-                    get_storage_diffs_from_bundle(bundle_state, &replay_state.database);
+                    get_storage_diffs_from_bundle(bundle_state, &mut replay_database);
 
                 let account_changesets = eth_api
                     .provider()
@@ -838,7 +857,7 @@ where
                     StateProviderDatabase::new(post_state.into_evm_state_provider()),
                 )
                 .map_err(|err| {
-                    Eth::Error::from_eth_err(BlockExecutionError::msg(format!(
+                    trace_execution_error::<Eth::Error>(BlockExecutionError::msg(format!(
                         "trace_debankBlock failed to build canonical state diff for block {}: {err}",
                         block.number(),
                     )))
@@ -847,7 +866,7 @@ where
                 if replayed_state_diff != canonical_state_diff {
                     let replayed_hash = keccak256(alloy_rlp::encode(&replayed_state_diff));
                     let canonical_hash = keccak256(alloy_rlp::encode(&canonical_state_diff));
-                    return Err(Eth::Error::from_eth_err(BlockExecutionError::msg(format!(
+                    return Err(trace_execution_error::<Eth::Error>(BlockExecutionError::msg(format!(
                         "trace_debankBlock state diff mismatch for block {}: replayed {} (accounts {}, deleted {}, storage {}, codes {}), canonical {} (accounts {}, deleted {}, storage {}, codes {})",
                         block.number(),
                         replayed_hash,
@@ -865,7 +884,10 @@ where
 
                 Ok((all_results, canonical_state_diff, change_addresses))
             })
-            .await?;
+            .await
+            .inspect_err(|error| {
+                tracing::error!(target: "debank_rpc", ?error, "block trace replay failed");
+            })?;
 
         // Assemble block file.
         // Classification uses per-node success from build_debank_traces, with
@@ -972,15 +994,9 @@ impl<Eth> std::fmt::Debug for DebankTraceBlock<Eth> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reth_revm::MainContext;
-    use revm::{
-        Context,
-        database::{CacheDB, EmptyDB},
-    };
-    use revm_inspectors::tracing::types::{CallTrace, CallTraceNode, TraceMemberOrder};
+    use evm2_inspectors::tracing::types::{CallTrace, CallTraceNode, TraceMemberOrder};
     use tempo_evm::TempoBlockEnv;
     use tempo_precompiles::storage::StorageAction;
-    use tempo_revm::TempoTxEnv;
 
     const OWN_WRITE: NativeStorageWrites = NativeStorageWrites {
         own: true,
@@ -991,22 +1007,19 @@ mod tests {
     fn native_inspector_attributes_journaled_storage_to_precompile_frame() {
         let root = Address::repeat_byte(0x11);
         let precompile = Address::repeat_byte(0x22);
-        let mut context: TempoContext<_> = Context::mainnet()
-            .with_db(CacheDB::new(EmptyDB::default()))
-            .with_block(TempoBlockEnv::default())
-            .with_cfg(Default::default())
-            .with_tx(TempoTxEnv::default());
-        let mut inspector = NativeStorageChangeInspector::default();
-
-        inspector.start_frame(&context, root);
-        inspector.start_frame(&context, precompile);
-        context.journal_mut().load_account(precompile).unwrap();
-        context
-            .journal_mut()
-            .sstore(precompile, U256::ZERO, U256::from(1))
-            .unwrap();
-        inspector.finish_frame(&context, true);
-        inspector.finish_frame(&context, false);
+        let actions = StorageActions::enabled();
+        let mut inspector = NativeStorageChangeInspector::new(actions.clone());
+        inspector.start_frame(root, false);
+        inspector.start_frame(precompile, true);
+        // EVM2's native storage adapter records successful sstore calls in StorageActions.
+        actions.record(StorageAction::Sstore(
+            precompile,
+            U256::ZERO,
+            U256::ZERO,
+            U256::ONE,
+        ));
+        inspector.finish_frame();
+        inspector.finish_frame();
 
         assert_eq!(
             inspector.into_changes(),
@@ -1022,32 +1035,26 @@ mod tests {
         let precompile = Address::repeat_byte(0x22);
         let other = Address::repeat_byte(0x33);
         let actions = StorageActions::enabled();
-        let mut context: TempoContext<_> = Context::mainnet()
-            .with_db(CacheDB::new(EmptyDB::default()))
-            .with_block(TempoBlockEnv::default())
-            .with_cfg(Default::default())
-            .with_tx(TempoTxEnv::default());
         let mut inspector = NativeStorageChangeInspector::new(actions.clone());
 
-        // Journaled write to another account, e.g. TIP20Factory initializing a new token.
-        inspector.start_frame(&context, precompile);
-        context.journal_mut().load_account(other).unwrap();
-        context
-            .journal_mut()
-            .sstore(other, U256::ZERO, U256::from(1))
-            .unwrap();
-        inspector.finish_frame(&context, true);
-
-        // Write to another account whose journal entry is gone, as after a revert: only the
-        // storage action remains.
-        inspector.start_frame(&context, precompile);
+        // A native precompile can write another account, e.g. TIP20Factory creating a token.
+        inspector.start_frame(precompile, true);
         actions.record(StorageAction::Sstore(
             other,
             U256::ZERO,
             U256::ZERO,
             U256::ONE,
         ));
-        inspector.finish_frame(&context, true);
+        inspector.finish_frame();
+        // The same action remains attributable after a native call reverts its state.
+        inspector.start_frame(precompile, true);
+        actions.record(StorageAction::Sstore(
+            other,
+            U256::ZERO,
+            U256::ZERO,
+            U256::ONE,
+        ));
+        inspector.finish_frame();
 
         let other_only = NativeStorageWrites {
             own: false,
@@ -1063,14 +1070,9 @@ mod tests {
     fn native_inspector_retains_storage_actions_after_journal_revert() {
         let precompile = Address::repeat_byte(0x22);
         let actions = StorageActions::enabled();
-        let context: TempoContext<_> = Context::mainnet()
-            .with_db(CacheDB::new(EmptyDB::default()))
-            .with_block(TempoBlockEnv::default())
-            .with_cfg(Default::default())
-            .with_tx(TempoTxEnv::default());
         let mut inspector = NativeStorageChangeInspector::new(actions.clone());
 
-        inspector.start_frame(&context, precompile);
+        inspector.start_frame(precompile, true);
         actions.record(StorageAction::Sstore(
             precompile,
             U256::ZERO,
@@ -1078,82 +1080,178 @@ mod tests {
             U256::ONE,
         ));
         // A failed precompile has already reverted its journal checkpoint before call_end.
-        assert!(context.journaled_state.journal.is_empty());
-        inspector.finish_frame(&context, true);
+        inspector.finish_frame();
 
         assert_eq!(inspector.into_changes(), vec![(precompile, OWN_WRITE)]);
     }
 
     #[test]
     fn debank_trace_marks_storage_writes_end_to_end() {
-        use alloy_primitives::{Bytes, bytes};
+        use alloy_consensus::{Signed, TxLegacy, transaction::Recovered};
+        use alloy_primitives::{Bytes, Signature, TxKind, bytes};
         use alloy_sol_types::SolCall;
-        use reth_evm::EvmEnv;
-        use revm::{
-            DatabaseCommit,
+        use evm2::{
             bytecode::Bytecode,
-            context::{CfgEnv, TxEnv},
-            primitives::TxKind,
-            state::AccountInfo,
+            evm::{AccountInfo, InMemoryDB},
         };
         use tempo_chainspec::hardfork::TempoHardfork;
-        use tempo_evm::evm::TempoEvm;
+        use tempo_evm::{TempoEvmEnv, TempoTxEnv};
         use tempo_precompiles::{
             PATH_USD_ADDRESS, storage::StorageCtx, test_util::TIP20Setup, tip20::ITIP20,
         };
-        use tempo_revm::gas_params::tempo_gas_params;
-
         let sender = Address::repeat_byte(0x01);
         let recipient = Address::repeat_byte(0x02);
         let spec = TempoHardfork::T11;
-        let mut evm = TempoEvm::new(
-            CacheDB::new(EmptyDB::default()),
-            EvmEnv::new(
-                CfgEnv::new_with_spec_and_gas_params(spec, tempo_gas_params(spec)),
-                TempoBlockEnv::default(),
-            ),
+        let sstore_contract = Address::repeat_byte(0x03);
+        let mut db = InMemoryDB::default();
+        db.insert_account_info(
+            &sstore_contract,
+            AccountInfo::default().with_code(Bytecode::new_raw(bytes!("6001600055"))),
         );
-        StorageCtx::enter_ctx(evm.ctx_mut(), StorageActions::disabled(), || {
+        let mut parent_db = db.clone();
+        let config = TempoEvmConfig::moderato();
+        let mut version = tempo_chainspec::gas_params::version(evm2::SpecId::OSAKA, spec, false);
+        version.chain_id = 1;
+        let mut evm = BlockExecutorFactory::evm_with_env(
+            &config,
+            db,
+            TempoEvmEnv {
+                spec,
+                version,
+                block: TempoBlockEnv {
+                    gas_limit: U256::from(30_000_000),
+                    ..Default::default()
+                },
+            },
+        );
+        let storage_actions = StorageActions::enabled();
+        evm.ext_mut().actions = storage_actions.clone();
+        let non_creditable_slots = evm.ext_mut().non_creditable_slots.clone();
+        evm.set_precompiles(tempo_precompiles::TempoPrecompiles::new(
+            spec,
+            storage_actions.clone(),
+            non_creditable_slots,
+        ));
+        let inspector_state = Rc::new(RefCell::new(new_debank_inspector(storage_actions.clone())));
+        evm.set_inspector(DebankInspector(inspector_state.clone()));
+        StorageCtx::enter_evm_without_tip1060_accounting(&mut evm, || {
             TIP20Setup::path_usd(sender)
                 .with_issuer(sender)
                 .with_mint(sender, U256::from(1_000_000))
                 .apply()
         })
         .unwrap();
-        let setup_state = evm.ctx_mut().journaled_state.finalize();
-        evm.db_mut().commit(setup_state);
-        // PUSH1 1 PUSH1 0 SSTORE
-        let sstore_contract = Address::repeat_byte(0x03);
-        evm.db_mut().insert_account_info(
-            sstore_contract,
-            AccountInfo::from_bytecode(Bytecode::new_raw(bytes!("6001600055"))),
+        // Native protocol logs can arrive with no call/create hook. They must
+        // remain in receipt storage without panicking in the call-tree tracer.
+        assert!(!evm.state().logs().is_empty());
+        assert!(
+            inspector_state.borrow().trace.inner.traces().nodes()[0]
+                .logs
+                .is_empty()
         );
-
-        // Same wiring as trace_debankBlock. Each call runs against the same pre-state.
-        let evm = evm.with_actions();
-        let storage_actions = evm.storage_actions();
-        let mut evm = evm.with_inspector(new_debank_inspector(storage_actions));
-        let mut trace_call = |to: Address, data: Bytes| {
-            let result = evm
-                .transact(TempoTxEnv {
-                    inner: TxEnv {
-                        caller: sender,
+        evm.state_mut().logs_mut().clear();
+        evm.state_mut().commit_transaction();
+        storage_actions.clear();
+        inspector_state.replace(new_debank_inspector(storage_actions.clone()));
+        let mut trace_call = |to: Address, data: Bytes, aa: bool| {
+            let tx = Signed::new_unchecked(
+                TxLegacy {
+                    chain_id: Some(1),
+                    nonce: 0,
+                    gas_limit: 1_000_000,
+                    to: TxKind::Call(to),
+                    input: data,
+                    ..Default::default()
+                },
+                Signature::test_signature(),
+                B256::ZERO,
+            );
+            let envelope = if aa {
+                use tempo_primitives::{
+                    AASigned, TempoSignature, TempoTransaction,
+                    transaction::tt_signature::PrimitiveSignature,
+                };
+                tempo_primitives::TempoTxEnvelope::AA(AASigned::new_unhashed(
+                    TempoTransaction {
+                        chain_id: 1,
                         gas_limit: 1_000_000,
-                        kind: TxKind::Call(to),
-                        data,
+                        fee_token: Some(PATH_USD_ADDRESS),
+                        calls: vec![
+                            Call {
+                                to: TxKind::Call(to),
+                                input: tx.tx().input.clone(),
+                                value: U256::ZERO,
+                            },
+                            Call {
+                                to: TxKind::Call(sstore_contract),
+                                input: Bytes::new(),
+                                value: U256::ZERO,
+                            },
+                        ],
                         ..Default::default()
                     },
-                    fee_token: Some(PATH_USD_ADDRESS),
-                    ..Default::default()
-                })
-                .unwrap();
+                    TempoSignature::Primitive(PrimitiveSignature::Secp256k1(
+                        Signature::test_signature(),
+                    )),
+                ))
+            } else {
+                tempo_primitives::TempoTxEnvelope::Legacy(tx)
+            };
+            let tx_env: TempoTxEnv = Recovered::new_unchecked(envelope, sender).into();
+            inspector_state.borrow_mut().trace.set_aa(aa);
+            // Exercise pre_traceMany's parity filtering as well as DeBank's tree.
+            inspector_state
+                .borrow_mut()
+                .trace
+                .inner
+                .config_mut()
+                .exclude_precompile_calls = aa;
+            let result = evm
+                .transact(&Recovered::new_unchecked(tx_env, sender))
+                .unwrap()
+                .detach();
             assert!(result.result.is_success(), "{:?}", result.result);
-
-            let next_inspector = new_debank_inspector(evm.storage_actions());
-            let (inspector, native) = mem::replace(evm.components_mut().1, next_inspector);
-            let mut arena = inspector.into_traces();
+            use evm2::evm::StateChangeSource;
+            let mut changes = reth_execution_types::TransactionChanges::default();
+            let Ok(()) = result.pending_state.visit(&mut changes);
+            let mut block_state = reth_execution_types::BlockState::new();
+            block_state.commit(&changes);
+            let diff = get_storage_diffs_from_bundle(block_state.into_bundle(), &mut parent_db);
+            assert!(
+                diff.new_codes.is_empty(),
+                "unchanged code must not be emitted"
+            );
+            if aa || to == sstore_contract {
+                let storage = diff
+                    .storage_diffs
+                    .iter()
+                    .find(|entry| entry.address == keccak256(sstore_contract))
+                    .expect("real EVM SSTORE must reach the state diff");
+                assert!(storage.diffs.iter().any(|entry| {
+                    entry.index == keccak256([0u8; 32]) && entry.value == U256::ONE
+                }));
+            }
+            let DebankInspectorState {
+                trace: inspector,
+                native,
+            } = inspector_state.replace(new_debank_inspector(storage_actions.clone()));
+            storage_actions.clear();
+            if aa {
+                let parity = inspector
+                    .inner
+                    .clone()
+                    .into_parity_builder()
+                    .into_localized_transaction_traces(Default::default());
+                assert_eq!(parity.len(), 3);
+                assert_eq!(parity[1].trace.trace_address, vec![0]);
+                assert_eq!(parity[2].trace.trace_address, vec![1]);
+            }
+            let mut arena = inspector.inner.into_traces();
+            let raw_changes = native.into_changes();
             let native_changes =
-                align_native_storage_changes(&mut arena, native.into_changes(), true).unwrap();
+                align_native_storage_changes(&mut arena, raw_changes.clone(), true).unwrap_or_else(
+                    || panic!("native {raw_changes:?}, traces {:?}", arena.nodes()),
+                );
             let (traces, error_traces, _, _) = build_debank_traces(
                 B256::ZERO,
                 arena,
@@ -1161,13 +1259,12 @@ mod tests {
                 &std::cell::RefCell::new(0),
             );
             assert!(error_traces.is_empty());
-            assert_eq!(traces.len(), 1);
-            traces.into_iter().next().unwrap()
+            assert_eq!(traces.len(), if aa { 3 } else { 1 });
+            traces
         };
 
         // A TIP-20 transfer writes the token's own balances natively, without an SSTORE. TIP-20
-        // tokens are served through the precompile lookup, so only the call outcome identifies
-        // them as precompiles.
+        // tokens are served through the dynamic precompile lookup rather than a fixed address list.
         let transfer = trace_call(
             PATH_USD_ADDRESS,
             ITIP20::transferCall {
@@ -1176,14 +1273,35 @@ mod tests {
             }
             .abi_encode()
             .into(),
+            false,
         );
-        assert!(transfer.self_storage_change);
-        assert!(transfer.storage_change);
+        assert!(transfer[0].self_storage_change);
+        assert!(transfer[0].storage_change);
 
         // SSTORE flags of an EVM frame must survive merging its (empty) native writes.
-        let sstore = trace_call(sstore_contract, Bytes::new());
-        assert!(sstore.self_storage_change);
-        assert!(sstore.storage_change);
+        let sstore = trace_call(sstore_contract, Bytes::new(), false);
+        assert!(sstore[0].self_storage_change);
+        assert!(sstore[0].storage_change);
+
+        // Both top-level AA calls must survive under one synthetic transaction root.
+        let aa = trace_call(
+            PATH_USD_ADDRESS,
+            ITIP20::transferCall {
+                to: recipient,
+                amount: U256::from(100),
+            }
+            .abi_encode()
+            .into(),
+            true,
+        );
+        assert!(aa[0].trace_address.is_empty());
+        assert_eq!(aa[0].subtraces, 2);
+        assert_eq!(aa[1].trace_address, vec![0]);
+        assert_eq!(aa[1].to_addr, PATH_USD_ADDRESS);
+        assert!(aa[1].self_storage_change);
+        assert_eq!(aa[2].trace_address, vec![1]);
+        assert_eq!(aa[2].to_addr, sstore_contract);
+        assert!(aa[2].self_storage_change);
     }
 
     #[test]

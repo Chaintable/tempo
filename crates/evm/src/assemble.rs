@@ -1,10 +1,12 @@
 use crate::{
     TempoEvmConfig, TempoEvmFactory, block::TempoReceiptBuilder, context::TempoBlockExecutionCtx,
 };
-use alloy_evm::{block::BlockExecutionError, eth::EthBlockExecutorFactory};
 use alloy_primitives::{B256, Bloom};
-use reth_evm::execute::{BlockAssembler, BlockAssemblerInput};
-use reth_evm_ethereum::EthBlockAssembler;
+use reth_evm::{
+    BlockExecutionError, EvmEnv,
+    execute::{BlockAssembler, BlockAssemblerInput},
+};
+use reth_evm_ethereum::{EthBlockAssembler, EthBlockExecutorFactory};
 use reth_primitives_traits::SealedHeader;
 use std::sync::Arc;
 use tempo_chainspec::TempoChainSpec;
@@ -37,14 +39,12 @@ impl TempoBlockAssembler {
                     inner,
                     general_gas_limit,
                     shared_gas_limit,
-                    validator_set: _,
                     consensus_context,
-                    subblock_fee_recipients: _,
                 },
             parent,
             transactions,
             output,
-            bundle_state,
+            execution_state,
             state_provider,
             state_root,
             block_access_list_hash,
@@ -53,19 +53,23 @@ impl TempoBlockAssembler {
 
         let parent = SealedHeader::new_unhashed(parent.clone().into_header().inner);
 
-        let timestamp_millis_part = evm_env.block_env.timestamp_millis_part;
+        let timestamp_millis_part = evm_env.block_env().ext.timestamp_millis_part;
 
         // Delegate block building to the inner assembler
         let block = self.inner.assemble_block(
             BlockAssemblerInput::<
-                EthBlockExecutorFactory<TempoReceiptBuilder, TempoChainSpec, TempoEvmFactory>,
+                EthBlockExecutorFactory<
+                    TempoReceiptBuilder,
+                    reth_chainspec::ChainSpec,
+                    TempoEvmFactory,
+                >,
             >::new(
                 evm_env,
                 inner,
                 &parent,
                 transactions,
                 output,
-                bundle_state,
+                execution_state,
                 state_provider,
                 state_root,
                 block_access_list_hash,
@@ -99,20 +103,21 @@ impl BlockAssembler<TempoEvmConfig> for TempoBlockAssembler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_consensus::{Signed, TxLegacy};
-    use alloy_evm::{EvmEnv, block::BlockExecutionResult, eth::EthBlockExecutionCtx};
+    use crate::TempoEvmEnv;
+    use alloy_consensus::{SignableTransaction, TxLegacy};
     use alloy_primitives::{Address, B256, Bytes, Signature, TxKind, U256};
+    use evm2::env::BlockEnvExt;
     use reth_chainspec::EthChainSpec;
     use reth_evm::execute::BlockAssembler;
+    use reth_evm_ethereum::EthBlockExecutionCtx;
+    use reth_execution_types::BlockExecutionResult;
     use reth_primitives_traits::SealedHeader;
     use reth_storage_api::noop::NoopProvider;
-    use revm::{context::BlockEnv, database::BundleState};
-    use std::collections::HashMap;
+    use reth_trie_common::bundle_state::BundleState;
     use tempo_chainspec::spec::MODERATO;
     use tempo_primitives::{
         TempoHeader, TempoPrimitives, TempoReceipt, TempoTxEnvelope, TempoTxType,
     };
-    use tempo_revm::TempoBlockEnv;
 
     fn create_legacy_tx() -> TempoTxEnvelope {
         let tx = TxLegacy {
@@ -124,7 +129,7 @@ mod tests {
             value: U256::ZERO,
             input: Bytes::new(),
         };
-        TempoTxEnvelope::Legacy(Signed::new_unhashed(tx, Signature::test_signature()))
+        TempoTxEnvelope::Legacy(tx.into_signed(Signature::test_signature()))
     }
 
     fn create_test_receipt(gas_used: u64) -> TempoReceipt {
@@ -148,17 +153,17 @@ mod tests {
         let general_gas_limit = 10_000_000u64;
         let shared_gas_limit = 10_000_000u64;
 
-        let evm_env = EvmEnv {
-            block_env: TempoBlockEnv {
-                inner: BlockEnv {
-                    number: U256::from(block_number),
-                    timestamp: U256::from(timestamp),
-                    beneficiary: Address::repeat_byte(0x01),
-                    basefee: 1,
-                    gas_limit,
+        let evm_env = TempoEvmEnv {
+            block: BlockEnvExt {
+                number: U256::from(block_number),
+                timestamp: U256::from(timestamp),
+                beneficiary: Address::repeat_byte(0x01),
+                basefee: U256::from(1),
+                gas_limit: U256::from(gas_limit),
+                ext: tempo_primitives::TempoBlockExt {
+                    timestamp_millis_part,
                     ..Default::default()
                 },
-                timestamp_millis_part,
                 ..Default::default()
             },
             ..Default::default()
@@ -190,9 +195,7 @@ mod tests {
             },
             general_gas_limit,
             shared_gas_limit,
-            validator_set: None,
             consensus_context: None,
-            subblock_fee_recipients: HashMap::new(),
         };
 
         let tx = create_legacy_tx();
@@ -262,17 +265,13 @@ mod tests {
             parent_view: 4,
         };
 
-        let evm_env = EvmEnv {
-            block_env: TempoBlockEnv {
-                inner: BlockEnv {
-                    number: U256::ONE,
-                    timestamp: U256::from(1000),
-                    beneficiary: Address::repeat_byte(0x01),
-                    basefee: 1,
-                    gas_limit,
-                    ..Default::default()
-                },
-                timestamp_millis_part: 0,
+        let evm_env = TempoEvmEnv {
+            block: BlockEnvExt {
+                number: U256::from(1),
+                timestamp: U256::from(1000),
+                beneficiary: Address::repeat_byte(0x01),
+                basefee: U256::from(1),
+                gas_limit: U256::from(gas_limit),
                 ..Default::default()
             },
             ..Default::default()
@@ -301,9 +300,7 @@ mod tests {
             },
             general_gas_limit,
             shared_gas_limit,
-            validator_set: None,
             consensus_context: Some(ctx),
-            subblock_fee_recipients: HashMap::new(),
         };
 
         let transactions = vec![create_legacy_tx()];
@@ -344,17 +341,13 @@ mod tests {
         let general_gas_limit = 10_000_000u64;
         let shared_gas_limit = 10_000_000u64;
 
-        let evm_env = EvmEnv {
-            block_env: TempoBlockEnv {
-                inner: BlockEnv {
-                    number: U256::ONE,
-                    timestamp: U256::from(1000),
-                    beneficiary: Address::repeat_byte(0x01),
-                    basefee: 1,
-                    gas_limit,
-                    ..Default::default()
-                },
-                timestamp_millis_part: 0,
+        let evm_env = TempoEvmEnv {
+            block: BlockEnvExt {
+                number: U256::from(1),
+                timestamp: U256::from(1000),
+                beneficiary: Address::repeat_byte(0x01),
+                basefee: U256::from(1),
+                gas_limit: U256::from(gas_limit),
                 ..Default::default()
             },
             ..Default::default()
@@ -383,9 +376,7 @@ mod tests {
             },
             general_gas_limit,
             shared_gas_limit,
-            validator_set: None,
             consensus_context: None,
-            subblock_fee_recipients: HashMap::new(),
         };
 
         let transactions = vec![create_legacy_tx()];
