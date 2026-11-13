@@ -75,7 +75,13 @@ impl StorageAction {
 
     /// Returns whether this action writes persistent storage.
     pub const fn writes_storage(&self) -> bool {
-        !matches!(self, Self::Sload(..) | Self::FeeAmmLiquidityCheck(..))
+        match self {
+            Self::Sstore(..) | Self::Sinc(..) | Self::Sdec(..) | Self::FeeAmmSwap(..) => true,
+            Self::Sload(..)
+            | Self::FeeTokenBalanceCheck(..)
+            | Self::FeeAmmLiquidityCheck(..)
+            | Self::ConfigCommitment(..) => false,
+        }
     }
 }
 
@@ -382,6 +388,24 @@ mod tests {
             U256::ONE,
             U256::ONE,
             true,
+        ));
+        actions.record(StorageAction::FeeTokenBalanceCheck(
+            address,
+            key,
+            U256::ONE,
+            U256::ONE,
+            true,
+        ));
+        // Account-extension commitments are not storage slots, including actual writes.
+        actions.record(StorageAction::ConfigCommitment(
+            address,
+            B256::ZERO,
+            B256::ZERO,
+        ));
+        actions.record(StorageAction::ConfigCommitment(
+            address,
+            B256::ZERO,
+            B256::repeat_byte(1),
         ));
         assert!(actions.storage_writes_since(cursor).is_empty());
 
