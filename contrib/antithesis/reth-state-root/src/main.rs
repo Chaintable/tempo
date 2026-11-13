@@ -416,8 +416,8 @@ fn verify(factory: &ProviderFactory<Node>, state: &Model, tip: u64, state_tip: u
             .collect::<BTreeSet<_>>()
         {
             invariant!(
-                view.storage(*address, slot)?.unwrap_or_default()
-                    == entry.storage.get(&U256::from_be_bytes(slot.0)).copied().unwrap_or_default(),
+                view.storage(*address, slot)?.unwrap_or_default() ==
+                    entry.storage.get(&U256::from_be_bytes(slot.0)).copied().unwrap_or_default(),
                 "plain storage {address}/{slot} at {tip}"
             );
         }
@@ -480,9 +480,9 @@ fn metric_counts(snapshotter: &Snapshotter) -> BTreeMap<String, u64> {
         .into_iter()
         .filter_map(|(key, _, _, value)| {
             let name = key.key().name().to_string();
-            if !(name.contains("tree.root")
-                || name.contains("state_trie_overlay")
-                || name.contains("storage.overlay"))
+            if !(name.contains("tree.root") ||
+                name.contains("state_trie_overlay") ||
+                name.contains("storage.overlay"))
             {
                 return None;
             }

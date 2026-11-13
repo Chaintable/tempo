@@ -95,8 +95,8 @@ impl Engine {
         ensure!(backpressure > threshold, "persistence threshold is too large");
         ensure!(buffer <= threshold, "buffer must not exceed persistence threshold");
         ensure!(
-            masking == 0
-                || matches!(masking.checked_add(buffer), Some(window) if window < threshold),
+            masking == 0 ||
+                matches!(masking.checked_add(buffer), Some(window) if window < threshold),
             "masking blocks + buffer must be less than persistence threshold"
         );
         // Clear the default window before applying smaller thresholds: TreeConfig checks each
@@ -208,9 +208,9 @@ impl Engine {
         loop {
             let head = self.head();
             // Only an acknowledgement advances the durable frontiers; submission is asynchronous.
-            let must_wait = flush
-                || head.saturating_sub(self.state_tip).saturating_sub(self.buffer)
-                    >= self.backpressure;
+            let must_wait = flush ||
+                head.saturating_sub(self.state_tip).saturating_sub(self.buffer) >=
+                    self.backpressure;
             if let Some((db_tip, state_tip)) =
                 self.persistence.acknowledge(must_wait, self.timeout)?
             {
@@ -246,9 +246,9 @@ impl Engine {
             if self.persistence.is_idle() {
                 // Match EngineApiTreeHandler::get_save_blocks_input's Threshold and Head targets.
                 let next_db = if flush { head } else { head.saturating_sub(self.buffer) };
-                if flush
-                    || (head.saturating_sub(self.state_tip) > self.persistence_threshold
-                        && next_db > self.db_tip)
+                if flush ||
+                    (head.saturating_sub(self.state_tip) > self.persistence_threshold &&
+                        next_db > self.db_tip)
                 {
                     let next_state = if flush {
                         head

@@ -184,8 +184,8 @@ impl Collider {
                 Some(index) => {
                     let existing = &mut self.groups[index];
                     for member in group.members {
-                        if existing.members.len() < MAX_MEMBERS
-                            && !existing.members.contains(&member)
+                        if existing.members.len() < MAX_MEMBERS &&
+                            !existing.members.contains(&member)
                         {
                             existing.members.push(member);
                         }

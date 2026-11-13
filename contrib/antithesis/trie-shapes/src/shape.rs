@@ -58,8 +58,8 @@ impl ShapeTracker {
                 reached.emptied_storage |= trie.is_some() && previous.keys > 0 && keys.is_empty();
                 // A branch that is gone while keys remain under it merged into a leaf or extension.
                 reached.collapsed_branch |= previous.branches.iter().any(|branch| {
-                    !nodes.branches.contains(branch)
-                        && keys.iter().any(|key| key.starts_with(branch))
+                    !nodes.branches.contains(branch) &&
+                        keys.iter().any(|key| key.starts_with(branch))
                 });
                 // A branch now inside an earlier extension's path split that extension.
                 reached.split_extension |= previous.extensions.iter().any(|(end, length)| {
@@ -152,8 +152,8 @@ fn walk(
     let mut start = 0;
     while start < keys.len() {
         let nibble = keys[start].get_unchecked(branch);
-        let end = start
-            + keys[start..].iter().take_while(|key| key.get_unchecked(branch) == nibble).count();
+        let end = start +
+            keys[start..].iter().take_while(|key| key.get_unchecked(branch) == nibble).count();
         walk(
             storage,
             &keys[start..end],

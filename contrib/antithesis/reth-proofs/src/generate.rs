@@ -32,8 +32,8 @@ pub(crate) fn writes(
         }
         generated.push({
             let addresses = state.keys().copied().collect::<Vec<_>>();
-            let address = if !addresses.is_empty()
-                && (addresses.len() >= accounts || rng.random_ratio(3, 4))
+            let address = if !addresses.is_empty() &&
+                (addresses.len() >= accounts || rng.random_ratio(3, 4))
             {
                 addresses[rng.random_range(0..addresses.len())]
             } else {

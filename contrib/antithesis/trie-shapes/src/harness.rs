@@ -160,8 +160,8 @@ impl Client {
     pub fn wait() -> Result<(Self, Summary)> {
         let deadline = Instant::now() + STARTUP_WAIT;
         while Instant::now() < deadline {
-            if let Some(mut client) = Self::connect()?
-                && let Some(summary) = client.summary()?
+            if let Some(mut client) = Self::connect()? &&
+                let Some(summary) = client.summary()?
             {
                 return Ok((client, summary));
             }
