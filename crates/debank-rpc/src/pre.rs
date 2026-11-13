@@ -1,9 +1,9 @@
 use alloy_consensus::BlockHeader;
-use alloy_eips::{BlockId, Typed2718};
+use alloy_eips::BlockId;
 use alloy_primitives::B256;
 use alloy_rpc_types_eth::{BlockOverrides, Log, TransactionInfo, state::StateOverride};
 use evm2::evm::StateChangeSource;
-use evm2_inspectors::tracing::TracingInspectorConfig;
+use evm2_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
 use jsonrpsee::core::RpcResult;
 use reth_evm::EvmEnvFor;
 use reth_rpc_convert::RpcTxReq;
@@ -13,10 +13,7 @@ use reth_rpc_eth_api::{
 };
 use reth_rpc_eth_types::{EthApiError, StateCacheDb};
 
-use crate::{
-    tracing::RpcTracingInspector,
-    types::{PreError, PreErrorCode, PreResult},
-};
+use crate::types::{PreError, PreErrorCode, PreResult};
 
 /// `pre` namespace API implementation.
 #[derive(Clone)]
@@ -45,10 +42,7 @@ where
         block_timestamp: u64,
     ) -> PreResult {
         let result: Result<PreResult, PreError> = (|| {
-            let inspector = RpcTracingInspector::new(
-                TracingInspectorConfig::default_parity(),
-                tx_env.ty() == 0x76,
-            );
+            let inspector = TracingInspector::new(TracingInspectorConfig::default_parity());
             let (inspector, output) = self
                 .eth_api
                 .inspect(&mut *db, evm_env, &tx_env, inspector)
@@ -62,7 +56,6 @@ where
             if result.is_success() {
                 let gas_used = result.tx_gas_used();
                 let traces = inspector
-                    .inner
                     .into_parity_builder()
                     .into_localized_transaction_traces(tx_info);
                 let logs = result

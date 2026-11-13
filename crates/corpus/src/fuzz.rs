@@ -4,14 +4,15 @@
 
 use crate::{
     code,
-    store::{self, Catalog, Store},
+    store::{self, Catalog, Lease, Store},
     types::Input,
 };
 use alloy_eips::Encodable2718;
 use alloy_primitives::{Address, B256, Bytes, U256};
+use futures::{StreamExt, TryStreamExt, future::Either, stream};
 use reth_chainspec::{EthChainSpec, ForkCondition};
 use slatedb::DbReader;
-use std::{collections::BTreeMap, fs, path::Path};
+use std::{collections::BTreeMap, fs, path::Path, sync::Arc};
 use tempo_chainspec::{
     TempoChainSpec,
     hardfork::{TempoHardfork, TempoHardforks},
@@ -22,38 +23,58 @@ use tempo_fuzz_types::{
     TempoBlockchainInput, TempoHarnessInput,
 };
 use tempo_primitives::Block;
-use tokio::runtime::Runtime;
+use tokio::{runtime::Runtime, sync::mpsc};
+use tokio_util::task::AbortOnDropHandle;
+use tracing::warn;
 
-/// A complete corpus, open at its published checkpoint.
+/// Worker threads of a corpus's runtime: they renew its lease and decode the blocks it reads ahead.
+const WORKERS: usize = 4;
+
+/// Stored block bytes [Corpus::windows] aims to read per window.
+const WINDOW_BYTES: usize = 32 << 20;
+
+/// A corpus, open at its published checkpoint. A fill extending it meanwhile does not change
+/// what this reads.
 pub struct Corpus {
     runtime: Runtime,
-    reader: DbReader,
+    store: Store,
+    /// Keeps the snapshot readable while a fill extends the corpus; taken when dropped.
+    lease: Option<Lease>,
+    reader: Arc<DbReader>,
     catalog: Catalog,
     chain_spec: ChainSpecInput,
 }
 
 impl Corpus {
-    /// Opens the complete corpus at `url` (`s3://bucket/prefix` or `file:///directory`), with S3
-    /// reads going to `endpoint` when given.
+    /// Opens the published blocks of the corpus at `url` (`s3://bucket/prefix` or
+    /// `file:///directory`), with S3 reads going to `endpoint` when given.
     pub fn open(url: &str, endpoint: Option<&str>) -> eyre::Result<Self> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
+        // The workers renew the lease while the caller is not reading, and decode the windows it
+        // reads ahead ([Self::windows]).
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(WORKERS)
             .enable_all()
             .build()?;
-        let (reader, catalog, tip) = runtime.block_on(async {
+        let (store, mut catalog) = runtime.block_on(async {
             let store = Store::open(url, endpoint).await?;
             let (catalog, _) = store
                 .catalog()
                 .await?
                 .ok_or_else(|| eyre::eyre!("no corpus catalog at {url}"))?;
-            eyre::ensure!(catalog.complete, "corpus {url} is not complete");
+            eyre::Ok((store, catalog))
+        })?;
+        let lease = store.lease_published(&runtime, &mut catalog, || {})?;
+        let (reader, tip) = runtime.block_on(async {
             let reader = store.reader(&catalog).await?;
-            let tip = store::tip_timestamp(&reader, &catalog.context).await?;
-            eyre::Ok((reader, catalog, tip))
+            let tip = store::tip_timestamp(&reader, &catalog.cursor).await?;
+            eyre::Ok((reader, tip))
         })?;
         let chain_spec = chain_spec_input(&catalog, tip)?;
         Ok(Self {
             runtime,
-            reader,
+            store,
+            lease: Some(lease),
+            reader: Arc::new(reader),
             catalog,
             chain_spec,
         })
@@ -63,8 +84,18 @@ impl Corpus {
         &self.catalog
     }
 
+    /// Fails once the lease may expire, so reads through it must stop.
+    fn ensure_leased(&self) -> eyre::Result<()> {
+        eyre::ensure!(
+            !self.lease.as_ref().is_some_and(Lease::expiring),
+            "corpus lease expires before it can be renewed"
+        );
+        Ok(())
+    }
+
     /// `block`'s harness input.
     pub fn input(&self, block: u64) -> eyre::Result<TempoHarnessInput> {
+        self.ensure_leased()?;
         let stored = self
             .runtime
             .block_on(store::published(&self.reader, block))?
@@ -81,6 +112,132 @@ impl Corpus {
         blocks
             .into_iter()
             .map(|block| Ok((block, self.input(block)?)))
+    }
+
+    /// Each of `blocks`, in block order and once each, with its stored input size and harness
+    /// input, in windows of up to `window` blocks and about `WINDOW_BYTES` stored bytes, each read
+    /// and decoded on the corpus's runtime while the caller works on the one before. Iteration
+    /// stops after the first error.
+    pub fn windows(&self, mut blocks: Vec<u64>, window: usize) -> Windows<'_> {
+        blocks.sort_unstable();
+        blocks.dedup();
+        let (sender, receiver) = mpsc::channel(1);
+        let (reader, chain_spec) = (self.reader.clone(), self.chain_spec.clone());
+        let task = AbortOnDropHandle::new(self.runtime.spawn(async move {
+            // Each window is sized from the stored bytes per block of the one before, starting
+            // from one block, so heavy blocks come in fewer at a time.
+            let (mut rest, mut size) = (&blocks[..], 1);
+            while !rest.is_empty() {
+                let (blocks, tail) = rest.split_at(size.min(rest.len()));
+                rest = tail;
+                let read = async {
+                    let (Some(&first), Some(&last)) = (blocks.first(), blocks.last()) else {
+                        return Ok(Vec::new());
+                    };
+                    // A dense window is scanned whole. A sparse one is read with a point read per
+                    // block, inside its task, since a point read decompresses SST blocks too.
+                    let payloads = if last - first < SPARSE_SPAN * blocks.len() as u64 {
+                        let scanned = store::scan_blocks(&reader, blocks).await?;
+                        Either::Left(stream::iter(
+                            scanned
+                                .into_iter()
+                                .map(|payload| (payload.0.number, Some(payload))),
+                        ))
+                    } else {
+                        Either::Right(stream::iter(
+                            blocks.iter().copied().map(|block| (block, None)),
+                        ))
+                    };
+                    // Each block decodes in its own task, so a window decodes on every worker.
+                    payloads
+                        .map(|(block, payload)| {
+                            let (reader, chain_spec) = (reader.clone(), chain_spec.clone());
+                            // Aborted when dropped, so a dropped or failed window stops its reads.
+                            AbortOnDropHandle::new(tokio::spawn(async move {
+                                let (record, bytes) = match payload {
+                                    Some(payload) => payload,
+                                    None => store::published_payload(&reader, block).await?,
+                                };
+                                let stored = store::decode(&bytes, &record)?;
+                                store::resolve_code(&reader, &stored).await?;
+                                eyre::Ok(BlockInput {
+                                    block,
+                                    size: record.block_bytes,
+                                    input: TempoHarnessInput::Blockchain(harness_input(
+                                        &stored, chain_spec,
+                                    )?),
+                                })
+                            }))
+                        })
+                        .buffered(32)
+                        .map(|joined| joined.unwrap_or_else(|error| Err(error.into())))
+                        .try_fold(Vec::with_capacity(blocks.len()), |mut inputs, input| {
+                            inputs.push(input);
+                            async { Ok(inputs) }
+                        })
+                        .await
+                }
+                .await;
+                if let Ok(inputs) = &read
+                    && let Some(next) = (WINDOW_BYTES * inputs.len())
+                        .checked_div(inputs.iter().map(|input| input.size).sum())
+                {
+                    size = next.clamp(1, window.max(1));
+                }
+                let failed = read.is_err();
+                if sender.send(read).await.is_err() || failed {
+                    break;
+                }
+            }
+        }));
+        Windows {
+            corpus: self,
+            receiver: Some(receiver),
+            _task: task,
+        }
+    }
+}
+
+/// A window spanning at least this many corpus blocks per block it lists is read with point reads.
+const SPARSE_SPAN: u64 = 4;
+
+/// A corpus block read by [Corpus::windows].
+pub struct BlockInput {
+    pub block: u64,
+    /// Its stored input size in bytes.
+    pub size: usize,
+    pub input: TempoHarnessInput,
+}
+
+/// Windows of a [Corpus]'s blocks, from [Corpus::windows]. Dropping it stops the reads still running.
+pub struct Windows<'a> {
+    corpus: &'a Corpus,
+    /// `None` once an error was returned.
+    receiver: Option<mpsc::Receiver<eyre::Result<Vec<BlockInput>>>>,
+    _task: AbortOnDropHandle<()>,
+}
+
+impl Iterator for Windows<'_> {
+    type Item = eyre::Result<Vec<BlockInput>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let window = self.receiver.as_mut()?.blocking_recv()?;
+        // Checked after the read, so a window read while the lease was expiring is not returned.
+        let window = self.corpus.ensure_leased().and(window);
+        if window.is_err() {
+            self.receiver = None;
+        }
+        Some(window)
+    }
+}
+
+impl Drop for Corpus {
+    fn drop(&mut self) {
+        if let Some(lease) = self.lease.take()
+            && let Err(error) = lease.release(&self.runtime, &self.store)
+        {
+            warn!(%error, "Releasing the corpus lease failed; it expires on its own");
+        }
     }
 }
 
@@ -178,10 +335,11 @@ fn harness_input(stored: &Input, chain_spec: ChainSpecInput) -> eyre::Result<Tem
 pub fn block_list(catalog: &Catalog, blocks: &[u64]) -> String {
     let context = &catalog.context;
     let header = format!(
-        "# corpus {}..{} tip {} checkpoint {}\n",
+        "# corpus {}..{} parent {} tip {} checkpoint {}\n",
         context.start,
-        context.end,
-        context.tip,
+        catalog.cursor.next,
+        context.parent,
+        B256::from(catalog.cursor.parent),
         catalog.checkpoint.as_deref().unwrap_or("none")
     );
     blocks
@@ -193,15 +351,22 @@ pub fn block_list(catalog: &Catalog, blocks: &[u64]) -> String {
 /// any before the first header, which must be in its range.
 pub fn read_blocks(path: &Path, catalog: &Catalog) -> eyre::Result<Vec<u64>> {
     let context = &catalog.context;
-    let tip = format!(" tip {} ", context.tip);
+    // A corpus grows at its tip, so a section names it by the parent of its first block. Sections
+    // written before that name it by the tip it had then, which matches only an unextended corpus.
+    let parent = format!(" parent {} ", context.parent);
+    let tip = format!(" tip {} ", B256::from(catalog.cursor.parent));
     let (mut blocks, mut ours) = (Vec::new(), true);
     for line in fs::read_to_string(path)?.lines().map(str::trim) {
         if let Some(header) = line.strip_prefix('#') {
-            ours = header.contains(&tip);
+            ours = if header.contains(" parent ") {
+                header.contains(&parent)
+            } else {
+                header.contains(&tip)
+            };
         } else if ours && !line.is_empty() {
             let block: u64 = line.parse()?;
             eyre::ensure!(
-                (context.start..context.end).contains(&block),
+                (context.start..catalog.cursor.next).contains(&block),
                 "block {block} is outside the corpus"
             );
             blocks.push(block);

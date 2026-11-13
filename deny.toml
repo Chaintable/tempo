@@ -33,7 +33,8 @@ ignore = [
   "RUSTSEC-2026-0398",
   # https://rustsec.org/advisories/RUSTSEC-2026-0403
   "RUSTSEC-2026-0403",
-  # https://rustsec.org/advisories/RUSTSEC-2026-0441 pin-utils is unmaintained (archived)
+  # https://rustsec.org/advisories/RUSTSEC-2026-0441 pin-utils is unmaintained and is pulled
+  # in transitively (aws-smithy, nix, hyper-util and others) with no safe upgrade available.
   "RUSTSEC-2026-0441",
 ]
 
