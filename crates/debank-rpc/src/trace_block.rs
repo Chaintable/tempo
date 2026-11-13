@@ -4,15 +4,15 @@
 //! and state diffs for consumption by background-tracer → S3/Kafka → leafage-evm.
 
 use alloy_consensus::{BlockHeader, Transaction, TxReceipt, transaction::TxHashRef};
-use alloy_eips::{BlockId, Typed2718};
+use alloy_eips::BlockId;
 use alloy_primitives::{Address, B256, U256, keccak256};
 use alloy_rpc_types_eth::Header;
 use evm2::{
-    Inspector,
+    Inspector, InspectorConfig,
     evm::Db,
-    interpreter::{Interpreter, Message, MessageKind, MessageResult, opcode::OpCode},
+    interpreter::{Interpreter, Message, MessageKind, MessageResult, opcode::op},
 };
-use evm2_inspectors::tracing::{CallTraceArena, OpcodeFilter, TracingInspectorConfig};
+use evm2_inspectors::tracing::{CallTraceArena, TracingInspector, TracingInspectorConfig};
 use jsonrpsee::core::RpcResult;
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_errors::{BlockExecutionError, RethError};
@@ -39,7 +39,7 @@ use tempo_evm::{TempoEvmConfig, TempoEvmTypes};
 use tempo_precompiles::storage::StorageActions;
 use tempo_primitives::transaction::Call;
 
-use crate::{debank_trace::*, tracing::RpcTracingInspector};
+use crate::debank_trace::*;
 
 fn trace_execution_error<E: FromEthApiError>(error: BlockExecutionError) -> E {
     // FromEthApiError erases block-execution details into InternalEthError.
@@ -109,7 +109,7 @@ impl NativeStorageChangeInspector {
 
 #[derive(Debug)]
 struct DebankInspectorState {
-    trace: RpcTracingInspector,
+    trace: TracingInspector,
     native: NativeStorageChangeInspector,
 }
 
@@ -117,6 +117,10 @@ struct DebankInspectorState {
 struct DebankInspector(Rc<RefCell<DebankInspectorState>>);
 
 impl Inspector<TempoEvmTypes> for DebankInspector {
+    fn inspector_config(&self) -> InspectorConfig {
+        <TracingInspector as Inspector<TempoEvmTypes>>::inspector_config(&self.0.borrow().trace)
+    }
+
     fn initialize_interp(&mut self, interp: &mut Interpreter<'_, '_, TempoEvmTypes>) {
         self.0.borrow_mut().trace.initialize_interp(interp);
     }
@@ -130,7 +134,7 @@ impl Inspector<TempoEvmTypes> for DebankInspector {
     }
 
     fn log(&mut self, log: &alloy_primitives::Log, host: &mut tempo_evm::TempoEvm<'_>) {
-        <RpcTracingInspector as Inspector<TempoEvmTypes>>::log(
+        <TracingInspector as Inspector<TempoEvmTypes>>::log(
             &mut self.0.borrow_mut().trace,
             log,
             host,
@@ -193,7 +197,7 @@ impl Inspector<TempoEvmTypes> for DebankInspector {
         value: &U256,
         host: &mut tempo_evm::TempoEvm<'_>,
     ) {
-        <RpcTracingInspector as Inspector<TempoEvmTypes>>::selfdestruct(
+        <TracingInspector as Inspector<TempoEvmTypes>>::selfdestruct(
             &mut self.0.borrow_mut().trace,
             contract,
             target,
@@ -207,19 +211,19 @@ fn new_debank_inspector(actions: StorageActions) -> DebankInspectorState {
     let mut trace_cfg = TracingInspectorConfig::default_parity()
         .set_steps(true)
         .set_step_deltas(true)
-        .set_record_logs(true)
-        .set_exclude_precompile_calls(false);
-    trace_cfg.record_opcodes_filter = Some(OpcodeFilter::new().enabled(OpCode::SSTORE));
+        .set_record_logs(true);
+    trace_cfg.record_precompile_calls = false;
+    trace_cfg.record_opcodes_filter = Some([op::SSTORE].into_iter().collect());
     DebankInspectorState {
-        trace: RpcTracingInspector::new(trace_cfg, false),
+        trace: TracingInspector::new(trace_cfg),
         native: NativeStorageChangeInspector::new(actions),
     }
 }
 
 /// Aligns native inspector calls with tracing arena nodes.
 ///
-/// Standard transactions fill arena node zero. For AA transactions RpcTracingInspector adds
-/// the deployed protocol's synthetic transaction root and offsets the recorded call depths.
+/// Standard transactions fill arena node zero. Tempo starts AA calls at depth one, so the
+/// upstream tracing inspector retains an empty synthetic transaction root.
 /// Native writes only track real calls, so accept that one verified root before requiring an
 /// exact address match for every real call/create frame.
 fn align_native_storage_changes(
@@ -736,17 +740,16 @@ where
                 for (idx, tx) in block.transactions_recovered().enumerate() {
                     let tx_hash = tx_hashes[idx];
 
-                    inspector_state.borrow_mut().trace.set_aa(tx.ty() == 0x76);
                     let output = executor
                         .execute_transaction_without_commit(tx)
                         .map_err(trace_execution_error::<Eth::Error>)?;
 
                     let DebankInspectorState { trace: mut inspector, native: native_storage_inspector } =
                         inspector_state.replace(new_debank_inspector(storage_actions.clone()));
-                    inspector.inner.set_transaction_gas_limit(tx.gas_limit());
-                    inspector.inner.set_transaction_gas_used(tx_gas_used[idx]);
-                    inspector.inner.set_transaction_caller(Address::from(*tx.signer()));
-                    let mut arena = inspector.inner.into_traces();
+                    inspector.set_transaction_gas_limit(tx.gas_limit());
+                    inspector.set_transaction_gas_used(tx_gas_used[idx]);
+                    inspector.set_transaction_caller(Address::from(*tx.signer()));
+                    let mut arena = inspector.into_traces();
                     let raw_native_storage_changes = native_storage_inspector.into_changes();
                     let trace_node_count = arena.nodes().len();
                     let native_frame_count = raw_native_storage_changes.len();
@@ -1145,7 +1148,7 @@ mod tests {
         // remain in receipt storage without panicking in the call-tree tracer.
         assert!(!evm.state().logs().is_empty());
         assert!(
-            inspector_state.borrow().trace.inner.traces().nodes()[0]
+            inspector_state.borrow().trace.traces().nodes()[0]
                 .logs
                 .is_empty()
         );
@@ -1198,14 +1201,14 @@ mod tests {
                 tempo_primitives::TempoTxEnvelope::Legacy(tx)
             };
             let tx_env: TempoTxEnv = Recovered::new_unchecked(envelope, sender).into();
-            inspector_state.borrow_mut().trace.set_aa(aa);
             // Exercise pre_traceMany's parity filtering as well as DeBank's tree.
             inspector_state
                 .borrow_mut()
                 .trace
-                .inner
-                .config_mut()
-                .exclude_precompile_calls = aa;
+                .update_config(|mut config| {
+                    config.record_precompile_calls = aa;
+                    config
+                });
             let result = evm
                 .transact(&Recovered::new_unchecked(tx_env, sender))
                 .unwrap()
@@ -1238,7 +1241,6 @@ mod tests {
             storage_actions.clear();
             if aa {
                 let parity = inspector
-                    .inner
                     .clone()
                     .into_parity_builder()
                     .into_localized_transaction_traces(Default::default());
@@ -1246,7 +1248,7 @@ mod tests {
                 assert_eq!(parity[1].trace.trace_address, vec![0]);
                 assert_eq!(parity[2].trace.trace_address, vec![1]);
             }
-            let mut arena = inspector.inner.into_traces();
+            let mut arena = inspector.into_traces();
             let raw_changes = native.into_changes();
             let native_changes =
                 align_native_storage_changes(&mut arena, raw_changes.clone(), true).unwrap_or_else(

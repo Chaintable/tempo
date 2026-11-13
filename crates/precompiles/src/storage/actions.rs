@@ -1,6 +1,6 @@
 use std::{cell::RefCell, rc::Rc};
 
-use alloy_primitives::{Address, U256};
+use alloy_primitives::{Address, B256, U256};
 use tempo_contracts::precompiles::TIP_FEE_MANAGER_ADDRESS;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -53,6 +53,10 @@ pub enum StorageAction {
     /// `amount_out` - Amount of tokens to swap out.
     /// `has_enough_liquidity` - Whether the pool has enough liquidity.
     FeeAmmLiquidityCheck(U256, U256, U256, bool),
+    /// Records an account's configuration commitment before and after; equal for a read.
+    ///
+    /// Commitments live in the account extension, not in a storage slot.
+    ConfigCommitment(Address, B256, B256),
 }
 
 impl StorageAction {
@@ -63,14 +67,21 @@ impl StorageAction {
             | Self::FeeTokenBalanceCheck(address, ..)
             | Self::Sstore(address, ..)
             | Self::Sinc(address, ..)
-            | Self::Sdec(address, ..) => *address,
+            | Self::Sdec(address, ..)
+            | Self::ConfigCommitment(address, ..) => *address,
             Self::FeeAmmSwap(..) | Self::FeeAmmLiquidityCheck(..) => TIP_FEE_MANAGER_ADDRESS,
         }
     }
 
     /// Returns whether this action writes persistent storage.
     pub const fn writes_storage(&self) -> bool {
-        !matches!(self, Self::Sload(..) | Self::FeeAmmLiquidityCheck(..))
+        match self {
+            Self::Sstore(..) | Self::Sinc(..) | Self::Sdec(..) | Self::FeeAmmSwap(..) => true,
+            Self::Sload(..)
+            | Self::FeeTokenBalanceCheck(..)
+            | Self::FeeAmmLiquidityCheck(..)
+            | Self::ConfigCommitment(..) => false,
+        }
     }
 }
 
@@ -377,6 +388,24 @@ mod tests {
             U256::ONE,
             U256::ONE,
             true,
+        ));
+        actions.record(StorageAction::FeeTokenBalanceCheck(
+            address,
+            key,
+            U256::ONE,
+            U256::ONE,
+            true,
+        ));
+        // Account-extension commitments are not storage slots, including actual writes.
+        actions.record(StorageAction::ConfigCommitment(
+            address,
+            B256::ZERO,
+            B256::ZERO,
+        ));
+        actions.record(StorageAction::ConfigCommitment(
+            address,
+            B256::ZERO,
+            B256::repeat_byte(1),
         ));
         assert!(actions.storage_writes_since(cursor).is_empty());
 

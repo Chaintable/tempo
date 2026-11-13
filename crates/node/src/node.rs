@@ -157,7 +157,7 @@ impl Default for TempoNodeArgs {
             max_txs_per_lane: DEFAULT_MAX_TXS_PER_LANE,
             txpool_filter: None,
             builder_state_provider_metrics: false,
-            builder_disable_prewarming: true,
+            builder_disable_prewarming: false,
             builder_enable_prewarming: true,
             builder_parallel: false,
             engine_disable_execution_cache_sharing_with_builder: false,
@@ -949,6 +949,14 @@ where
                 .with_custom_tx_type(TempoTxType::AA as u8)
                 .no_eip4844()
                 .build_with_tasks(ctx.task_executor().clone(), blob_store.clone());
+
+        if !ctx.config().debug.lazy_kzg_settings {
+            let kzg_settings = validator.validator().kzg_settings().clone();
+            ctx.task_executor().spawn_blocking_task(async move {
+                let _ = kzg_settings.get();
+                debug!(target: "reth::cli", "Initialized KZG settings");
+            });
+        }
 
         let aa_2d_config = AA2dPoolConfig {
             price_bump_config: pool_config.price_bumps,
