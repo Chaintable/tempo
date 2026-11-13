@@ -118,9 +118,11 @@ pre 传块 N（内部读取 N−1），multi 传 N−1 并覆盖 N 的时间与�
 
 ## 5. 后续事项与部署注意
 
+2026-11-13 用户确认：`pre_traceMany` 已无使用方，其差异和缺口不再作为本轮及后续升级的发布 gate；保留接口源码和历史测试结果，未将严格 FAIL 改写为 PASS。Claude Opus 5.5 对产品代码的独立审查未发现新增 P0/P1，发现的 AA 顶层零值以太坊预编译调用被 pre parity builder 过滤（P3，代码核对、未定向复现）及批次 expiring-nonce 误拒（继承 P2）均记录为停用接口的已知限制，本轮不修复。`trace_debankBlock` 与 `eth_multiCall` 继续作为验收范围。
+
 - 本版 certified follow/验证者模式禁止与 debug.rpc-consensus-url 或 debug.etherscan 混用；本次部署没有这些 debug 参数。
 - T4 前非空 subblock 的历史 trace 仍使用保留支持的旧 CT 版本和兼容数据副本。
-- `pre_traceMany` 的重复 expiring nonce 仍被两版拒绝，外层 code 都是 1000；新版上游将其映射为 `ServerError(-32003)` / `expiring nonce transaction already included`，旧版为 `Revm error: nonce manager error: ... ExpiringNonceReplay(ExpiringNonceReplay)`。RPC 直接暴露上游错误的 `to_string()`，本轮未为文本恢复旧映射；下游是否依赖该文本未验证，需在合并前接受这一兼容性变化。Halt 文本和部分 trace 失败双重日志的旧项也仍保留。
+- `pre_traceMany` 的重复 expiring nonce 仍被两版拒绝，外层 code 都是 1000；新版上游将其映射为 `ServerError(-32003)` / `expiring nonce transaction already included`，旧版为 `Revm error: nonce manager error: ... ExpiringNonceReplay(ExpiringNonceReplay)`。RPC 直接暴露上游错误的 `to_string()`，本轮未为文本恢复旧映射；用户于 2026-11-13 确认 pre 接口已不再使用，本轮保留该差异并批准合并发布。Halt 文本和部分 trace 失败双重日志的旧项也仍保留。
 - 正常 SIGTERM 停机的 follower 错误导致 exit=1；本次重启恢复和输出检查通过，但未修复该退出码/停机日志行为。
 - 本轮不是 genesis 全历史重放，不覆盖未激活硬分叉的真实主网行为；ETL/Kafka 真实投递和生产 rollout 未执行。
 - 官方公告从下一版起将镜像签名验证切至 GitHub provenance；当前 CT 构建发布机制没有因此变更。
