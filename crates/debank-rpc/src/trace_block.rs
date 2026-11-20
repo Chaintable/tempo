@@ -958,7 +958,6 @@ where
 // jsonrpsee server trait implementation
 // ---------------------------------------------------------------------------
 
-#[async_trait::async_trait]
 impl<Eth> crate::DebankTraceApiServer for DebankTraceBlock<Eth>
 where
     Eth: EthApiTypes
