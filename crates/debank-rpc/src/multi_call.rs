@@ -146,7 +146,6 @@ where
 }
 
 /// jsonrpsee server trait implementation.
-#[async_trait::async_trait]
 impl<Eth> crate::DebankEthExtApiServer<RpcTxReq<Eth::NetworkTypes>> for DebankEthExt<Eth>
 where
     Eth: EthApiTypes + EthCall + 'static,
