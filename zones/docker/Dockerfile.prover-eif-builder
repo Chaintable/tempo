@@ -1,6 +1,6 @@
 FROM nitro-kernel AS nitro-kernel
 
-FROM public.ecr.aws/amazonlinux/amazonlinux:2023@sha256:d9b4c61f49de68d41e43af1c0ef89c5600b0ad51da024406a15f5d014720c998
+FROM public.ecr.aws/amazonlinux/amazonlinux:2023@sha256:5c38fd85b00ce8c094315d9b71f671f880052314a22bd25f1a027821bf61d9d7
 
 ARG NITRO_CLI_VERSION=1.4.5-0.amzn2023
 
